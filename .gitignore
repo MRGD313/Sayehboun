@@ -1,0 +1,28 @@
+# Secrets and local config
+.env
+.env.local
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Bot runtime
+.bot.lock
+.bot.instance.lock
+
+# Debug / local scratch (may contain session or chat ids)
+_debug_*
+_quick_test.txt
+_metis_bot_check.json
+.project
+
+# Tuner reports may contain real patient session data
+tuner/reports/*
+!tuner/reports/.gitkeep

@@ -1,0 +1,20 @@
+{
+  "current": "v1",
+  "versions": {
+    "v1": {
+      "file": "history_taker_v1.txt",
+      "created_at": "2026-05-28",
+      "note": "Original history taker prompt (Metis console / pre-tuner baseline)",
+      "applied_to_metis": true
+    },
+    "v2": {
+      "file": "history_taker_v2.txt",
+      "created_at": "2026-05-31",
+      "note": "Tuner report session 74: neuro red flags, vitals, allergy, functional status",
+      "source_session_id": 74,
+      "source_report": "reports/session_74_20260531_065114",
+      "applied_to_metis": true,
+      "sync_backup_bot": true
+    }
+  }
+}

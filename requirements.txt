@@ -1,0 +1,7 @@
+python-bale-bot
+python-dotenv
+openai
+requests
+metisai
+httpx
+python-docx
