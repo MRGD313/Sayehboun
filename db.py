@@ -23,6 +23,16 @@ class SessionState:
     updated_at: str
 
 
+@dataclass
+class JudgmentReview:
+    session_id: int
+    patient_chat_id: str
+    judgment_text: str
+    status: str
+    created_at: str
+    updated_at: str
+
+
 class Database:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -85,6 +95,18 @@ class Database:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS judgment_reviews (
+                    session_id INTEGER PRIMARY KEY,
+                    patient_chat_id TEXT NOT NULL,
+                    judgment_text TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -276,4 +298,106 @@ class Database:
                 """,
                 (json.dumps(messages, ensure_ascii=False), _now_iso(), session_id),
             )
+
+    def upsert_judgment_review(
+        self,
+        session_id: int,
+        patient_chat_id: str,
+        judgment_text: str,
+    ) -> None:
+        now = _now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO judgment_reviews(
+                    session_id, patient_chat_id, judgment_text, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    patient_chat_id = excluded.patient_chat_id,
+                    judgment_text = excluded.judgment_text,
+                    status = 'pending',
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, patient_chat_id, judgment_text, now, now),
+            )
+
+    def get_judgment_review(self, session_id: int) -> JudgmentReview | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT session_id, patient_chat_id, judgment_text, status, created_at, updated_at
+                FROM judgment_reviews
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return JudgmentReview(
+            session_id=int(row["session_id"]),
+            patient_chat_id=row["patient_chat_id"],
+            judgment_text=row["judgment_text"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def set_judgment_review_status(self, session_id: int, status: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE judgment_reviews
+                SET status = ?, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (status, _now_iso(), session_id),
+            )
+
+    def get_editing_judgment_review(self) -> JudgmentReview | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT session_id, patient_chat_id, judgment_text, status, created_at, updated_at
+                FROM judgment_reviews
+                WHERE status = 'editing'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            return None
+        return JudgmentReview(
+            session_id=int(row["session_id"]),
+            patient_chat_id=row["patient_chat_id"],
+            judgment_text=row["judgment_text"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def set_doctor_active_review_session(self, session_id: int) -> None:
+        now = _now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings(key, value, updated_at)
+                VALUES ('doctor_active_review_session_id', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (str(session_id), now),
+            )
+
+    def get_doctor_active_review_session_id(self) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                ("doctor_active_review_session_id",),
+            ).fetchone()
+        if not row:
+            return None
+        raw = str(row["value"]).strip()
+        return int(raw) if raw.isdigit() else None
 

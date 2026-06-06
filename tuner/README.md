@@ -12,14 +12,14 @@ Add to **`sayehboun/.env`** (project root):
 
 ```env
 METIS_EVALUATOR_BOT_ID=your-evaluator-bot-id
-PROMPT_VERSION=v1
+PROMPT_VERSION=v3
 ```
 
 `METIS_BOT_ID` / `DEEPSEEK_API_KEY` / `SQLITE_DB_PATH` are reused automatically.
 
-Evaluator bot instructions: paste `tuner/prompts/evaluator_instructions.txt` into Metis.
+Evaluator bot instructions: `tuner/prompts/evaluator_instructions.txt` (your text, unchanged).
 
-**Metis tip:** Leave **summarizer** empty on the evaluator bot (same as history taker).
+**Evaluator model (Metis):** `google` / `gemini-3.1-pro-preview` (Gemini 3.1 Pro), summarizer empty.
 
 ## Prompt versioning
 
@@ -29,12 +29,24 @@ Stored under `tuner/prompts/versions/`:
 |------|---------|
 | `history_taker_v1.txt` | Original prompt |
 | `history_taker_v2.txt` | Tuner iteration from session 74 |
+| `history_taker_v3.txt` | Triage-focused phases (current in Metis) |
 | `manifest.json` | Version metadata + which is **current** |
-| `CURRENT` | Quick marker (`v1`) |
+| `CURRENT` | Quick marker (`v3`) |
 
-**Current version: `v1`** (also in root `.env` as `PROMPT_VERSION=v1`).
+**Current history taker: `v3`** (`.env` → `PROMPT_VERSION=v3`).
 
-When you change the Metis prompt, register a new version:
+### History formatter
+
+| File | Purpose |
+|------|---------|
+| `history_formatter_instructions.txt` | Current formatter prompt (Metis) |
+| `history_formatter_v1.txt` | Versioned copy |
+| `formatter_manifest.json` | Formatter version metadata |
+| `FORMATTER_CURRENT` | Quick marker (`v1`) |
+
+**Formatter model (Metis):** `deepseek` / `deepseek-v4-flash` — unchanged.
+
+When you change the history taker Metis prompt, register a new version:
 
 ```powershell
 py tune.py prompt register v3 --file reports\session_XX_revised_instructions.txt --note "your note" --session-id 74 --set-current

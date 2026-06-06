@@ -1,0 +1,13 @@
+{
+  "current": "v1",
+  "model": "deepseek-v4-flash",
+  "provider": "deepseek",
+  "versions": {
+    "v1": {
+      "file": "history_formatter_v1.txt",
+      "created_at": "2026-06-04",
+      "note": "Bale/Telegram-safe formatting: exact quotes, emoji blueprint, no HTML",
+      "applied_to_metis": true
+    }
+  }
+}

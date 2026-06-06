@@ -10,10 +10,60 @@ from metisai.metistypes import Message, MessageContent, MessageRequest, Session
 METIS_REQUEST_TIMEOUT = 120.0
 METIS_MAX_ATTEMPTS = 3
 METIS_API_BASE = "https://api.metisai.ir"
+METIS_API_HOSTS = ("api.metisai.ir", "metisai.ir", ".metisai.ir")
+
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
 def use_system_proxy() -> bool:
+    """When true, Bale HTTP may use OS/VPN proxy. Metis always stays direct."""
     return os.getenv("USE_SYSTEM_PROXY", "").strip().lower() in {"1", "true", "yes"}
+
+
+def metis_uses_direct_connection() -> bool:
+    """Metis bypasses VPN/proxy unless METIS_USE_SYSTEM_PROXY=1."""
+    return os.getenv("METIS_USE_SYSTEM_PROXY", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def apply_metis_direct_network() -> None:
+    """
+    Route Metis API calls outside VPN/proxy (LAN/proxy VPN modes on Windows).
+    Safe to call more than once. Does not change Bale polling unless USE_SYSTEM_PROXY=1.
+    """
+    if not metis_uses_direct_connection():
+        metis_log("network", "metis_proxy_mode", mode="system_proxy")
+        return
+
+    for key in _PROXY_ENV_KEYS:
+        os.environ.pop(key, None)
+
+    existing = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    for host in METIS_API_HOSTS:
+        if host not in parts:
+            parts.append(host)
+    no_proxy = ",".join(parts)
+    os.environ["NO_PROXY"] = no_proxy
+    os.environ["no_proxy"] = no_proxy
+    metis_log("network", "metis_direct", no_proxy=no_proxy)
+
+
+def metis_http_client_kwargs() -> dict[str, Any]:
+    """httpx kwargs for Metis: direct by default (ignore VPN/proxy env)."""
+    if metis_uses_direct_connection():
+        return {"trust_env": False, "proxy": None}
+    return {"trust_env": True}
 
 
 def metis_log(service: str, step: str, **fields: object) -> None:
@@ -58,9 +108,15 @@ def classify_metis_error(err: Exception) -> str:
 
 
 def check_metis_network() -> None:
-    metis_log("network", "startup_check_begin", use_system_proxy=use_system_proxy())
-    modes = [("direct", False)]
-    if use_system_proxy():
+    apply_metis_direct_network()
+    metis_log(
+        "network",
+        "startup_check_begin",
+        metis_direct=metis_uses_direct_connection(),
+        bale_use_system_proxy=use_system_proxy(),
+    )
+    modes: list[tuple[str, bool]] = [("direct", False)]
+    if not metis_uses_direct_connection():
         modes.append(("system_proxy", True))
 
     for mode_name, trust_env in modes:
@@ -89,17 +145,16 @@ def check_metis_network() -> None:
 
 
 def create_metis_bot(api_key: str, bot_id: str) -> metisai.MetisBot:
+    apply_metis_direct_network()
+    kwargs = metis_http_client_kwargs()
     metis_log(
         "client",
         "init",
         bot_id=bot_id,
-        use_system_proxy=use_system_proxy(),
+        metis_direct=metis_uses_direct_connection(),
+        trust_env=kwargs.get("trust_env"),
     )
-    return metisai.MetisBot(
-        api_key=api_key,
-        bot_id=bot_id,
-        trust_env=use_system_proxy(),
-    )
+    return metisai.MetisBot(api_key=api_key, bot_id=bot_id, **kwargs)
 
 
 def _session_id(session: Session | str) -> str:

@@ -334,6 +334,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     sayehboun_root = Path(__file__).resolve().parent.parent
     load_dotenv(sayehboun_root / ".env")
+    sys.path.insert(0, str(sayehboun_root))
+    from metis_utils import apply_metis_direct_network
+
+    apply_metis_direct_network()
     parser = build_parser()
     args = parser.parse_args()
     return args.func(args)

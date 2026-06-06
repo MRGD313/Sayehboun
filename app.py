@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import traceback
 from pathlib import Path
@@ -8,18 +9,29 @@ import msvcrt
 import requests
 from dotenv import load_dotenv
 
-from db import Database
+from db import Database, JudgmentReview
 from deepseek_client import DeepSeekClient
 from history_formatter import MetisHistoryFormatterClient
-from metis_utils import check_metis_network, metis_log
+from judging_client import MetisJudgingClient
+from metis_utils import apply_metis_direct_network, check_metis_network, metis_log
 
 START_MESSAGE = "سلام...در خدمتم...مشکل سلامتی اتون رو بفرمایید"
 FINAL_MESSAGE = "اطلاعات شما ثبت شد. تا دقایقی دیگه نتیجه برای شما ارسال می شود."
 DOCTOR_FORMATTER_ERROR = "error in history formatter bot"
+DOCTOR_JUDGING_ERROR = "error in judging bot"
+DOCTOR_EDIT_PROMPT = "متن نهایی را برای بیمار بنویسید و ارسال کنید (بدون pid/sid/time)."
+DOCTOR_SENT_TO_PATIENT_ACK = "✅ برای بیمار ارسال شد."
+DOCTOR_ALREADY_SENT_ACK = "این نظر قبلاً برای بیمار ارسال شده است."
+DOCTOR_APPROVE_BUTTON = "👍🏻"
+DOCTOR_EDIT_BUTTON = "✏️ ویرایش"
+DOCTOR_REVIEW_HINT = "👍🏻 = ارسال به بیمار | ✏️ ویرایش = ویرایش و ارسال"
+JUDGMENT_APPROVE_CALLBACK_PREFIX = "judgment:approve:"
+JUDGMENT_EDIT_CALLBACK_PREFIX = "judgment:edit:"
 PHASE3_ENDING_MESSAGE = "لطفاً به این موارد پاسخ دهید تا اطلاعات شما برای بررسی نهایی آماده شود."
 DEEPSEEK_ERROR_MESSAGE = "شرمنده ... ظاهرا مشکلی پیش آمده است..لطفا کمی بعد دوباره تلاش کنید"
 AI_WAIT_MESSAGE = "در حال آماده‌سازی سوالات... لطفاً چند لحظه صبر کنید."
 CONTINUE_BUTTON_TEXT = "ادامه بده"
+RESTART_BUTTON_TEXT = "شروع مجدد"
 CONTINUE_HINT_TEXT = 'وقتی پاسختون تکمیل شد روی دکمه "ادامه بده" بزنید'
 EMPTY_CONTINUE_WARNING = "لطفاً اول پاسخ‌هاتون رو ارسال کنید، بعد روی دکمه ادامه بده بزنید."
 DEMOGRAPHIC_QUESTIONS: list[tuple[str, str]] = [
@@ -81,7 +93,7 @@ def _resolve_doctor_chat_id(db: Database) -> str:
     return os.getenv("DOCTOR_CHAT_ID", "").strip()
 
 
-def _build_formatter_payload(
+def _build_session_payload(
     *,
     patient_chat_id: str,
     session_id: int,
@@ -119,6 +131,21 @@ def _format_history_with_retry(formatter: MetisHistoryFormatterClient, payload: 
     return ""
 
 
+def _judge_with_retry(judging: MetisJudgingClient, payload: str) -> str:
+    last_error: Exception | None = None
+    for _ in range(2):
+        try:
+            result = judging.judge(payload)
+            if result.strip():
+                return result.strip()
+        except Exception as err:
+            last_error = err
+        time.sleep(1)
+    if last_error:
+        raise last_error
+    return ""
+
+
 def _send_doctor_report(
     *,
     token: str,
@@ -140,13 +167,14 @@ def _send_doctor_report(
 def _complete_session_and_notify_doctor(
     db: Database,
     formatter: MetisHistoryFormatterClient,
+    judging: MetisJudgingClient,
     *,
     token: str,
     patient_chat_id: str,
     session_id: int,
     demographics: dict[str, str],
 ) -> None:
-    _send_text(token, patient_chat_id, FINAL_MESSAGE)
+    _send_text(token, patient_chat_id, FINAL_MESSAGE, reply_markup=_chat_keyboard())
     db.append_message(session_id, "bot", FINAL_MESSAGE)
 
     session = db.get_session_by_id(session_id)
@@ -154,7 +182,7 @@ def _complete_session_and_notify_doctor(
         return
 
     doctor_chat_id = _resolve_doctor_chat_id(db)
-    payload = _build_formatter_payload(
+    payload = _build_session_payload(
         patient_chat_id=patient_chat_id,
         session_id=session_id,
         chief_complaint=session.chief_complaint,
@@ -199,6 +227,45 @@ def _complete_session_and_notify_doctor(
             body=structured,
         )
 
+    try:
+        judgment = _judge_with_retry(judging, payload)
+    except Exception:
+        metis_log("bot", "judging_error", session_id=session_id)
+        if doctor_chat_id:
+            _send_doctor_report(
+                token=token,
+                doctor_chat_id=doctor_chat_id,
+                patient_chat_id=patient_chat_id,
+                session_id=session_id,
+                session_time=session.created_at,
+                body=DOCTOR_JUDGING_ERROR,
+            )
+        return
+
+    if not judgment:
+        if doctor_chat_id:
+            _send_doctor_report(
+                token=token,
+                doctor_chat_id=doctor_chat_id,
+                patient_chat_id=patient_chat_id,
+                session_id=session_id,
+                session_time=session.created_at,
+                body=DOCTOR_JUDGING_ERROR,
+            )
+        return
+
+    db.append_message(session_id, "judgment", judgment)
+    if doctor_chat_id:
+        _send_doctor_judgment_for_review(
+            db,
+            token=token,
+            doctor_chat_id=doctor_chat_id,
+            patient_chat_id=patient_chat_id,
+            session_id=session_id,
+            session_time=session.created_at,
+            judgment=judgment,
+        )
+
 
 def _send_phase_questions(
     db: Database,
@@ -220,7 +287,7 @@ def _send_phase_questions(
         phase=phase,
         cc_chars=len(chief_complaint),
     )
-    _send_text(token, chat_id, AI_WAIT_MESSAGE)
+    _send_text(token, chat_id, AI_WAIT_MESSAGE, reply_markup=_chat_keyboard())
     db.append_message(session_id, "bot", AI_WAIT_MESSAGE)
     questions_text = deepseek.generate_phase_questions(
         chat_key=chat_id,
@@ -238,7 +305,7 @@ def _send_phase_questions(
         token,
         chat_id,
         final_text,
-        reply_markup=_continue_keyboard(),
+        reply_markup=_chat_keyboard(),
     )
     db.append_message(session_id, "bot", final_text)
     db.update_session(
@@ -264,11 +331,321 @@ def _send_text(token: str, chat_id: str, text: str, reply_markup: dict | None = 
         raise RuntimeError(f"sendMessage failed: {data}")
 
 
-def _continue_keyboard() -> dict:
+def _answer_callback_query(token: str, callback_query_id: str, text: str = "") -> None:
+    if callback_query_id.startswith("1"):
+        metis_log("bot", "answer_callback_skipped", reason="legacy_client")
+        return
+    payload: dict[str, object] = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        response = _http.post(
+            f"https://tapi.bale.ai/bot{token}/answerCallbackQuery",
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            metis_log("bot", "answer_callback_failed", detail=str(data)[:200])
+    except Exception as err:
+        metis_log("bot", "answer_callback_failed", error=str(err)[:200])
+
+
+def _doctor_judgment_keyboard() -> dict:
     return {
-        "keyboard": [[{"text": CONTINUE_BUTTON_TEXT}]],
+        "keyboard": [
+            [
+                {"text": DOCTOR_APPROVE_BUTTON},
+                {"text": DOCTOR_EDIT_BUTTON},
+            ]
+        ],
         "resize_keyboard": True,
     }
+
+
+def _judgment_review_keyboard(session_id: int) -> dict:
+    """Inline fallback (Bale answerCallbackQuery may fail on some clients)."""
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": DOCTOR_APPROVE_BUTTON,
+                    "callback_data": f"{JUDGMENT_APPROVE_CALLBACK_PREFIX}{session_id}",
+                },
+                {
+                    "text": DOCTOR_EDIT_BUTTON,
+                    "callback_data": f"{JUDGMENT_EDIT_CALLBACK_PREFIX}{session_id}",
+                },
+            ]
+        ]
+    }
+
+
+def _get_review_for_doctor_action(db: Database, session_id: int | None) -> JudgmentReview | None:
+    if session_id is not None:
+        return db.get_judgment_review(session_id)
+    active = db.get_doctor_active_review_session_id()
+    if active is not None:
+        return db.get_judgment_review(active)
+    return None
+
+
+def _approve_judgment_review(
+    db: Database,
+    *,
+    token: str,
+    doctor_chat_id: str,
+    session_id: int,
+) -> None:
+    review = db.get_judgment_review(session_id)
+    if not review:
+        _send_text(token, doctor_chat_id, "یافت نشد.")
+        return
+    if review.status == "sent":
+        _send_text(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
+        return
+    if _send_judgment_to_patient_from_review(
+        db,
+        token=token,
+        review=review,
+        text=review.judgment_text,
+    ):
+        _send_text(token, doctor_chat_id, DOCTOR_SENT_TO_PATIENT_ACK)
+    else:
+        _send_text(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
+
+
+def _start_judgment_edit(
+    db: Database,
+    *,
+    token: str,
+    doctor_chat_id: str,
+    session_id: int,
+) -> None:
+    review = db.get_judgment_review(session_id)
+    if not review:
+        _send_text(token, doctor_chat_id, "یافت نشد.")
+        return
+    if review.status == "sent":
+        _send_text(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
+        return
+    db.set_judgment_review_status(session_id, "editing")
+    db.set_doctor_active_review_session(session_id)
+    _send_text(
+        token,
+        doctor_chat_id,
+        f"{DOCTOR_EDIT_PROMPT}\n\nsid: {session_id}",
+        reply_markup=_doctor_judgment_keyboard(),
+    )
+
+
+def _send_doctor_judgment_for_review(
+    db: Database,
+    *,
+    token: str,
+    doctor_chat_id: str,
+    patient_chat_id: str,
+    session_id: int,
+    session_time: str,
+    judgment: str,
+) -> None:
+    db.upsert_judgment_review(session_id, patient_chat_id, judgment)
+    db.set_doctor_active_review_session(session_id)
+    header = (
+        f"pid: {patient_chat_id}\n"
+        f"sid: {session_id}\n"
+        f"time: {session_time}\n\n"
+        f"{judgment}\n\n"
+        f"{DOCTOR_REVIEW_HINT}"
+    )
+    _send_text(
+        token,
+        doctor_chat_id,
+        header,
+        reply_markup=_doctor_judgment_keyboard(),
+    )
+
+
+def _strip_doctor_report_header(text: str) -> str:
+    """Remove pid/sid/time metadata if doctor copy-pastes the full doctor message."""
+    cleaned = text.strip()
+    cleaned = re.sub(
+        r"^pid:\s*\S+\s*\n"
+        r"sid:\s*\S+\s*\n"
+        r"time:\s*\S+\s*\n+",
+        "",
+        cleaned,
+        count=1,
+    )
+    if DOCTOR_REVIEW_HINT in cleaned:
+        cleaned = cleaned.replace(DOCTOR_REVIEW_HINT, "").strip()
+    return cleaned.strip()
+
+
+def _deliver_judgment_to_patient(
+    db: Database,
+    *,
+    token: str,
+    session_id: int,
+    patient_chat_id: str,
+    text: str,
+) -> None:
+    patient_text = _strip_doctor_report_header(text)
+    _send_text(token, patient_chat_id, patient_text, reply_markup=_chat_keyboard())
+    db.append_message(session_id, "judgment_to_patient", patient_text)
+    db.set_judgment_review_status(session_id, "sent")
+
+
+def _send_judgment_to_patient_from_review(
+    db: Database,
+    *,
+    token: str,
+    review,
+    text: str,
+) -> bool:
+    if review.status == "sent":
+        return False
+    _deliver_judgment_to_patient(
+        db,
+        token=token,
+        session_id=review.session_id,
+        patient_chat_id=review.patient_chat_id,
+        text=text,
+    )
+    return True
+
+
+def _process_doctor_review_buttons(
+    db: Database,
+    *,
+    token: str,
+    doctor_chat_id: str,
+    text: str,
+) -> bool:
+    if text not in (DOCTOR_APPROVE_BUTTON, DOCTOR_EDIT_BUTTON):
+        return False
+    review = _get_review_for_doctor_action(db, db.get_doctor_active_review_session_id())
+    if not review:
+        _send_text(token, doctor_chat_id, "نظری برای بررسی یافت نشد.")
+        return True
+    if text == DOCTOR_APPROVE_BUTTON:
+        _approve_judgment_review(
+            db,
+            token=token,
+            doctor_chat_id=doctor_chat_id,
+            session_id=review.session_id,
+        )
+        return True
+    _start_judgment_edit(
+        db,
+        token=token,
+        doctor_chat_id=doctor_chat_id,
+        session_id=review.session_id,
+    )
+    return True
+
+
+def _process_doctor_edit_message(
+    db: Database,
+    *,
+    token: str,
+    doctor_chat_id: str,
+    text: str,
+) -> bool:
+    review = db.get_editing_judgment_review()
+    if not review:
+        return False
+    if not text.strip():
+        _send_text(token, doctor_chat_id, "متن خالی است. دوباره ارسال کنید.")
+        return True
+    if _send_judgment_to_patient_from_review(
+        db,
+        token=token,
+        review=review,
+        text=text.strip(),
+    ):
+        _send_text(token, doctor_chat_id, DOCTOR_SENT_TO_PATIENT_ACK)
+    else:
+        _send_text(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
+    return True
+
+
+def _process_judgment_callback(
+    db: Database,
+    *,
+    token: str,
+    callback_query: dict,
+) -> None:
+    callback_id = str(callback_query.get("id") or "")
+    data = str(callback_query.get("data") or "").strip()
+    sender = callback_query.get("from") or callback_query.get("from_user") or {}
+    doctor_chat_id = str(sender.get("id") or "").strip()
+    resolved_doctor = _resolve_doctor_chat_id(db)
+
+    if not callback_id or not data or not doctor_chat_id:
+        return
+    if resolved_doctor and doctor_chat_id != resolved_doctor:
+        _answer_callback_query(token, callback_id, text="فقط پزشک مجاز است.")
+        return
+
+    if data.startswith(JUDGMENT_APPROVE_CALLBACK_PREFIX):
+        session_id = int(data.removeprefix(JUDGMENT_APPROVE_CALLBACK_PREFIX))
+        _approve_judgment_review(
+            db,
+            token=token,
+            doctor_chat_id=doctor_chat_id,
+            session_id=session_id,
+        )
+        _answer_callback_query(token, callback_id)
+        return
+
+    if data.startswith(JUDGMENT_EDIT_CALLBACK_PREFIX):
+        session_id = int(data.removeprefix(JUDGMENT_EDIT_CALLBACK_PREFIX))
+        _start_judgment_edit(
+            db,
+            token=token,
+            doctor_chat_id=doctor_chat_id,
+            session_id=session_id,
+        )
+        _answer_callback_query(token, callback_id)
+        return
+
+
+def _chat_keyboard() -> dict:
+    return {
+        "keyboard": [
+            [{"text": CONTINUE_BUTTON_TEXT}],
+            [{"text": RESTART_BUTTON_TEXT}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def _begin_patient_session(
+    db: Database,
+    deepseek: DeepSeekClient,
+    *,
+    token: str,
+    chat_id: str,
+    user_label: str,
+) -> None:
+    deepseek.reset_session(chat_id)
+    session_id = db.create_session(chat_id)
+    db.append_message(session_id, "user", user_label)
+    start_text = f"{START_MESSAGE}\n\n{CONTINUE_HINT_TEXT}"
+    _send_text(
+        token,
+        chat_id,
+        start_text,
+        reply_markup=_chat_keyboard(),
+    )
+    db.append_message(session_id, "bot", start_text)
+    db.update_session(
+        session_id,
+        waiting_for_continue=1,
+        answer_buffer=[],
+    )
 
 
 def _acquire_single_instance_lock():
@@ -293,6 +670,7 @@ def _process_text_message(
     db: Database,
     deepseek: DeepSeekClient,
     formatter: MetisHistoryFormatterClient,
+    judging: MetisJudgingClient,
     *,
     token: str,
     chat_id: str,
@@ -301,22 +679,31 @@ def _process_text_message(
 ) -> None:
     if raw_message:
         _maybe_register_doctor(db, raw_message)
-    if text == "/start":
-        deepseek.reset_session(chat_id)
-        session_id = db.create_session(chat_id)
-        db.append_message(session_id, "user", text)
-        start_text = f"{START_MESSAGE}\n\n{CONTINUE_HINT_TEXT}"
-        _send_text(
-            token,
-            chat_id,
-            start_text,
-            reply_markup=_continue_keyboard(),
-        )
-        db.append_message(session_id, "bot", start_text)
-        db.update_session(
-            session_id,
-            waiting_for_continue=1,
-            answer_buffer=[],
+
+    doctor_chat_id = _resolve_doctor_chat_id(db)
+    if doctor_chat_id and chat_id == doctor_chat_id:
+        if _process_doctor_edit_message(
+            db,
+            token=token,
+            doctor_chat_id=doctor_chat_id,
+            text=text,
+        ):
+            return
+        if _process_doctor_review_buttons(
+            db,
+            token=token,
+            doctor_chat_id=doctor_chat_id,
+            text=text,
+        ):
+            return
+
+    if text in ("/start", RESTART_BUTTON_TEXT):
+        _begin_patient_session(
+            db,
+            deepseek,
+            token=token,
+            chat_id=chat_id,
+            user_label=text,
         )
         return
 
@@ -333,7 +720,7 @@ def _process_text_message(
                     token,
                     chat_id,
                     EMPTY_CONTINUE_WARNING,
-                    reply_markup=_continue_keyboard(),
+                    reply_markup=_chat_keyboard(),
                 )
                 db.append_message(session.id, "bot", EMPTY_CONTINUE_WARNING)
                 return
@@ -355,6 +742,7 @@ def _process_text_message(
                 _complete_session_and_notify_doctor(
                     db,
                     formatter,
+                    judging,
                     token=token,
                     patient_chat_id=chat_id,
                     session_id=session.id,
@@ -389,7 +777,7 @@ def _process_text_message(
     if missing:
         pending_key, question = missing
         db.update_session(session.id, pending_field=pending_key)
-        _send_text(token, chat_id, question)
+        _send_text(token, chat_id, question, reply_markup=_chat_keyboard())
         db.append_message(session.id, "bot", question)
         return
 
@@ -404,6 +792,7 @@ def _process_text_message(
                     _complete_session_and_notify_doctor(
                         db,
                         formatter,
+                        judging,
                         token=token,
                         patient_chat_id=chat_id,
                         session_id=session.id,
@@ -437,13 +826,14 @@ def _process_text_message(
     except Exception as err:
         metis_log("bot", "phase_questions_error", chat_id=chat_id, error=str(err)[:300])
         traceback.print_exc()
-        _send_text(token, chat_id, DEEPSEEK_ERROR_MESSAGE)
+        _send_text(token, chat_id, DEEPSEEK_ERROR_MESSAGE, reply_markup=_chat_keyboard())
         db.append_message(session.id, "bot", DEEPSEEK_ERROR_MESSAGE)
 
 
 def main() -> None:
     lock_handle = _acquire_single_instance_lock()
     load_dotenv()
+    apply_metis_direct_network()
     token = os.getenv("BALE_BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("BALE_BOT_TOKEN is missing in environment.")
@@ -458,6 +848,9 @@ def main() -> None:
     metis_structure_bot_id = os.getenv("METIS_STRUCTURE_BOT_ID", "").strip()
     if not metis_structure_bot_id:
         raise RuntimeError("METIS_STRUCTURE_BOT_ID is missing in environment.")
+    metis_judging_bot_id = os.getenv("METIS_JUDGING_BOT_ID", "").strip()
+    if not metis_judging_bot_id:
+        raise RuntimeError("METIS_JUDGING_BOT_ID is missing in environment.")
     # deepseek-chat is the recommended model name via MetisAI DeepSeek endpoint
     deepseek_model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
     if not deepseek_model:
@@ -478,6 +871,11 @@ def main() -> None:
         api_key=deepseek_api_key,
         bot_id=metis_structure_bot_id,
     )
+    judging = MetisJudgingClient(
+        api_key=deepseek_api_key,
+        bot_id=metis_judging_bot_id,
+    )
+    print(f"Judging Metis bot configured: {metis_judging_bot_id}", flush=True)
 
     doctor_chat_id = _resolve_doctor_chat_id(db)
     if not doctor_chat_id:
@@ -537,6 +935,16 @@ def main() -> None:
                     update_id = int(update.get("update_id", 0))
                     offset = update_id + 1
 
+                    callback_query = update.get("callback_query")
+                    if callback_query:
+                        try:
+                            _process_judgment_callback(
+                                db, token=token, callback_query=callback_query
+                            )
+                        except Exception as err:
+                            metis_log("bot", "callback_error", error=str(err)[:300])
+                        continue
+
                     message = update.get("message") or {}
                     text = (message.get("text") or "").strip()
                     chat = message.get("chat") or {}
@@ -560,6 +968,7 @@ def main() -> None:
                         db,
                         deepseek,
                         formatter,
+                        judging,
                         token=token,
                         chat_id=chat_id,
                         text=text,

@@ -1,17 +1,25 @@
 import json
 import os
 import re
+import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
 import metisai
 from metisai.metistypes import MessageContent, MessageRequest
 
+_SAYEH_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_SAYEH_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SAYEH_ROOT))
+
+from metis_utils import (  # noqa: E402
+    apply_metis_direct_network,
+    create_metis_bot as _create_metis_bot,
+    metis_http_client_kwargs,
+)
+
 METIS_API_BASE = "https://api.metisai.ir/api/v1"
-
-
-def use_system_proxy() -> bool:
-    return os.getenv("USE_SYSTEM_PROXY", "").strip().lower() in {"1", "true", "yes"}
 
 
 def metis_timeout() -> float:
@@ -23,17 +31,14 @@ def metis_timeout() -> float:
 
 
 def create_metis_bot(api_key: str, bot_id: str) -> metisai.MetisBot:
-    return metisai.MetisBot(
-        api_key=api_key,
-        bot_id=bot_id,
-        trust_env=use_system_proxy(),
-    )
+    return _create_metis_bot(api_key, bot_id)
 
 
 def fetch_bot_instructions(api_key: str, bot_id: str) -> str:
+    apply_metis_direct_network()
     headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
     url = f"{METIS_API_BASE}/bots/{bot_id}"
-    with httpx.Client(trust_env=use_system_proxy(), timeout=30.0) as client:
+    with httpx.Client(timeout=30.0, **metis_http_client_kwargs()) as client:
         response = client.get(url, headers=headers)
         response.raise_for_status()
         data = response.json()
@@ -42,15 +47,54 @@ def fetch_bot_instructions(api_key: str, bot_id: str) -> str:
 
 
 def save_bot_instructions(api_key: str, bot_id: str, instructions: str) -> None:
+    apply_metis_direct_network()
     headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
     url = f"{METIS_API_BASE}/bots/{bot_id}"
-    with httpx.Client(trust_env=use_system_proxy(), timeout=60.0) as client:
+    with httpx.Client(timeout=60.0, **metis_http_client_kwargs()) as client:
         response = client.get(url, headers=headers)
         response.raise_for_status()
         data = response.json()
         data["instructions"] = instructions
         put_response = client.put(url, headers=headers, json=data)
         put_response.raise_for_status()
+
+
+def save_evaluator_bot(
+    api_key: str,
+    bot_id: str,
+    instructions: str,
+    *,
+    provider_name: str = "google",
+    model: str = "gemini-3.1-pro-preview",
+    temperature: float = 0.2,
+    max_tokens: int = 9000,
+) -> dict[str, Any]:
+    """Update evaluator bot instructions + model on Metis."""
+    apply_metis_direct_network()
+    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
+    url = f"{METIS_API_BASE}/bots/{bot_id}"
+    with httpx.Client(timeout=60.0, **metis_http_client_kwargs()) as client:
+        response = client.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        data["instructions"] = instructions
+        data["summarizer"] = None
+        data["providerConfig"] = {
+            "provider": {
+                "name": provider_name,
+                "model": model,
+                "acceptImageAttachment": True,
+                "acceptFileAttachment": True,
+            },
+            "args": {
+                "temperature": temperature,
+                "response_format": {"type": "json_object"},
+                "maxTokens": max_tokens,
+            },
+        }
+        put_response = client.put(url, headers=headers, json=data)
+        put_response.raise_for_status()
+        return put_response.json()
 
 
 def send_evaluator_request(

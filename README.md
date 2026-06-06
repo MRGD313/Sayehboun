@@ -15,7 +15,8 @@ Sayehboun is an open-source [Bale](https://bale.ai) bot for **Persian-language c
 
 ```
 Patient (Bale) → app.py → Metis history taker (3 phases)
-                      → Metis formatter → Doctor notification (Bale)
+                      → Metis formatter → Doctor (formatted history)
+                      → Metis judging bot → Doctor (triage judgment)
                       → SQLite (sessions, demographics, settings)
 ```
 
@@ -50,6 +51,19 @@ py app.py
 
 Only one instance should run at a time (enforced via `.bot.instance.lock`).
 
+**Restart (always stops all instances first):**
+
+```powershell
+py bot_ctl.py restart
+# or
+.\restart_bot.ps1
+```
+
+```powershell
+py bot_ctl.py stop
+py bot_ctl.py start
+```
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the full list. Main keys:
@@ -61,8 +75,12 @@ See [`.env.example`](.env.example) for the full list. Main keys:
 | `METIS_BOT_ID` | Primary history taker bot |
 | `METIS_BOT_ID_BACKUP` | Backup history taker |
 | `METIS_STRUCTURE_BOT_ID` | History formatter bot |
+| `METIS_JUDGING_BOT_ID` | Judging / triage bot (`sayehboun_judging_bot`) |
+| `FORMATTER_PROMPT_VERSION` | Formatter prompt version (`v1`, …) |
 | `DOCTOR_BALE_USERNAME` | Doctor account for notifications |
 | `PROMPT_VERSION` | Active prompt version label (`v1`, `v2`, …) |
+
+**VPN / proxy:** Metis API calls always bypass the system HTTP proxy and `HTTP_PROXY` env vars (default). Use `METIS_USE_SYSTEM_PROXY=1` only if you intentionally want Metis through the VPN. Bale polling uses `USE_SYSTEM_PROXY=1` for the same. Full-tunnel VPN apps may still need split-tunnel rules for `api.metisai.ir` in the VPN client.
 
 ## Prompt tuner
 
@@ -85,6 +103,7 @@ sayehboun/
 ├── db.py                  # SQLite persistence
 ├── deepseek_client.py     # Metis history taker client
 ├── history_formatter.py   # Structured history formatter
+├── judging_client.py      # Triage judgment bot for doctor
 ├── metis_utils.py         # Metis HTTP helpers, retries, logging
 ├── tuner/                 # Prompt evaluation & versioning
 └── requirements.txt

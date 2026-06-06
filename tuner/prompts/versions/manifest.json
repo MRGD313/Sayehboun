@@ -1,11 +1,11 @@
 {
-  "current": "v1",
+  "current": "v3",
   "versions": {
     "v1": {
       "file": "history_taker_v1.txt",
       "created_at": "2026-05-28",
       "note": "Original history taker prompt (Metis console / pre-tuner baseline)",
-      "applied_to_metis": true
+      "applied_to_metis": false
     },
     "v2": {
       "file": "history_taker_v2.txt",
@@ -13,6 +13,13 @@
       "note": "Tuner report session 74: neuro red flags, vitals, allergy, functional status",
       "source_session_id": 74,
       "source_report": "reports/session_74_20260531_065114",
+      "applied_to_metis": false,
+      "sync_backup_bot": true
+    },
+    "v3": {
+      "file": "history_taker_v3.txt",
+      "created_at": "2026-06-04",
+      "note": "Manual Metis update: triage-focused phases, max 4/4/3 questions, English instructions, Persian output only",
       "applied_to_metis": true,
       "sync_backup_bot": true
     }
