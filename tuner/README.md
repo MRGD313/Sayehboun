@@ -46,6 +46,17 @@ Stored under `tuner/prompts/versions/`:
 
 **Formatter model (Metis):** `deepseek` / `deepseek-v4-flash` — unchanged.
 
+### Judging bot
+
+| File | Purpose |
+|------|---------|
+| `judging_instructions.txt` | Current judging prompt (Metis) |
+| `judging_v1.txt` | Versioned copy |
+| `judging_manifest.json` | Judging version metadata |
+| `JUDGING_CURRENT` | Quick marker (`v1`) |
+
+**Judging model (Metis):** `deepseek` / `deepseek-v4-flash` — unchanged.
+
 When you change the history taker Metis prompt, register a new version:
 
 ```powershell

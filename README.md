@@ -76,6 +76,7 @@ See [`.env.example`](.env.example) for the full list. Main keys:
 | `METIS_BOT_ID_BACKUP` | Backup history taker |
 | `METIS_STRUCTURE_BOT_ID` | History formatter bot |
 | `METIS_JUDGING_BOT_ID` | Judging / triage bot (`sayehboun_judging_bot`) |
+| `JUDGING_PROMPT_VERSION` | Judging prompt version (`v1`, …) |
 | `FORMATTER_PROMPT_VERSION` | Formatter prompt version (`v1`, …) |
 | `DOCTOR_BALE_USERNAME` | Doctor account for notifications |
 | `PROMPT_VERSION` | Active prompt version label (`v1`, `v2`, …) |
