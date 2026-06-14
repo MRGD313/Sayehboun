@@ -40,7 +40,7 @@ https://www.paziresh24.com/s/?text={TEXT}&ref=search_suggestion_box_qs&semantic_
 ```
 
 3. **URL-encoding rules for `{TEXT}`:**
-   - Use the Persian specialty phrase as the patient would search on [پذیرش۲۴](https://www.paziresh24.com) (same language as item 4).
+   - Use the Persian specialty phrase as the patient would search on Paziresh24 (same language as item 4).
    - UTF-8 percent-encode the specialty text for the `text` query parameter (spaces may be `+` or `%20`).
    - Do **not** change any other query parameters (`ref`, `semantic_search`, `turn_type`, `sortBy`).
 
