@@ -1,0 +1,9 @@
+{
+  "sessions": {
+    "81": {
+      "tuned_at": "2026-06-13T06:22:01.905094+00:00",
+      "report": "judging_reports/session_81_20260613_062201.json",
+      "prompt_version": "v1"
+    }
+  }
+}

@@ -8,7 +8,7 @@ def _now_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
-def write_report(
+def write_judging_report(
     report_dir: Path,
     *,
     session_id: int,

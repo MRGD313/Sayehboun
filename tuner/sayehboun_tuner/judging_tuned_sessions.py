@@ -6,7 +6,7 @@ from typing import Any
 
 
 def registry_path(tuner_root: Path) -> Path:
-    return tuner_root / "tuned_sessions.json"
+    return tuner_root / "judging_tuned_sessions.json"
 
 
 def _empty_registry() -> dict[str, Any]:
@@ -26,12 +26,11 @@ def save_registry(tuner_root: Path, registry: dict[str, Any]) -> None:
 
 
 def bootstrap_from_reports(tuner_root: Path) -> dict[str, Any]:
-    """Backfill registry from report JSON files (current format only)."""
     registry = load_registry(tuner_root)
     if registry.get("sessions"):
         return registry
 
-    report_dir = tuner_root / "reports"
+    report_dir = tuner_root / "judging_reports"
     if not report_dir.is_dir():
         return registry
 

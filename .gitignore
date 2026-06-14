@@ -26,3 +26,5 @@ _metis_bot_check.json
 # Tuner reports may contain real patient session data
 tuner/reports/*
 !tuner/reports/.gitkeep
+tuner/judging_reports/*
+!tuner/judging_reports/.gitkeep

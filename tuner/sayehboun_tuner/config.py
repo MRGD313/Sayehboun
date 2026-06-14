@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 
+from sayehboun_tuner.evaluator_bots import history_taker_evaluator_bot_id
+
 
 @dataclass
 class Settings:
@@ -53,7 +55,7 @@ def load_settings() -> Settings:
         sayehboun_root=sayehboun_root,
         api_key=api_key,
         history_taker_bot_id=history_taker_bot_id,
-        evaluator_bot_id=os.getenv("METIS_EVALUATOR_BOT_ID", "").strip(),
+        evaluator_bot_id=history_taker_evaluator_bot_id(),
         staging_bot_id=os.getenv("METIS_HISTORY_TAKER_STAGING_BOT_ID", "").strip(),
         db_path=db_path,
         prompt_version=os.getenv("PROMPT_VERSION", "v1").strip(),

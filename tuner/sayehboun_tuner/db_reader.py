@@ -1,5 +1,4 @@
 import json
-import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +7,6 @@ from typing import Any
 PHASE3_ENDING = (
     "لطفاً به این موارد پاسخ دهید تا اطلاعات شما برای بررسی نهایی آماده شود."
 )
-FINAL_PATIENT_MSG = "اطلاعات شما ثبت شد"
 
 
 @dataclass
@@ -140,16 +138,25 @@ def build_evaluator_payload(
     history_taker_model: str,
     current_instructions_full: str,
 ) -> dict[str, Any]:
+    skip_roles = {"formatter", "judgment", "judgment_to_patient"}
+    chat_lines: list[str] = []
+    if session.chief_complaint.strip():
+        chat_lines.append(f"chief_complaint: {session.chief_complaint.strip()}")
+    for key, value in session.demographics.items():
+        chat_lines.append(f"{key}: {value}")
+    for item in session.messages:
+        role = str(item.get("role") or "unknown")
+        if role in skip_roles:
+            continue
+        text = (item.get("text") or "").strip()
+        if text:
+            chat_lines.append(f"[{role}] {text}")
+
     return {
         "session_id": session.id,
-        "chat_id": session.chat_id,
-        "created_at": session.created_at,
         "prompt_version": prompt_version,
         "history_taker_model": history_taker_model,
-        "current_instructions_full": current_instructions_full,
-        "chief_complaint": session.chief_complaint,
-        "demographics": session.demographics,
-        "session_messages": session.messages,
-        "history_taker_outputs": session.history_taker_outputs,
-        "phases_completed": session.phases_completed,
+        "current_prompt": current_instructions_full,
+        "packaged_chat_messages": "\n".join(chat_lines),
+        "history_taker_bot_outputs": session.history_taker_outputs,
     }

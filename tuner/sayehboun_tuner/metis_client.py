@@ -59,56 +59,17 @@ def save_bot_instructions(api_key: str, bot_id: str, instructions: str) -> None:
         put_response.raise_for_status()
 
 
-def save_evaluator_bot(
-    api_key: str,
-    bot_id: str,
-    instructions: str,
-    *,
-    provider_name: str = "google",
-    model: str = "gemini-3.1-pro-preview",
-    temperature: float = 0.2,
-    max_tokens: int = 9000,
-) -> dict[str, Any]:
-    """Update evaluator bot instructions + model on Metis."""
-    apply_metis_direct_network()
-    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
-    url = f"{METIS_API_BASE}/bots/{bot_id}"
-    with httpx.Client(timeout=60.0, **metis_http_client_kwargs()) as client:
-        response = client.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        data["instructions"] = instructions
-        data["summarizer"] = None
-        data["providerConfig"] = {
-            "provider": {
-                "name": provider_name,
-                "model": model,
-                "acceptImageAttachment": True,
-                "acceptFileAttachment": True,
-            },
-            "args": {
-                "temperature": temperature,
-                "response_format": {"type": "json_object"},
-                "maxTokens": max_tokens,
-            },
-        }
-        put_response = client.put(url, headers=headers, json=data)
-        put_response.raise_for_status()
-        return put_response.json()
-
-
-def send_evaluator_request(
+def send_tuner_request(
     api_key: str,
     evaluator_bot_id: str,
     payload: dict[str, Any],
+    *,
+    intro: str,
 ) -> str:
     bot = create_metis_bot(api_key, evaluator_bot_id)
     session = bot.create_session()
     try:
-        user_text = (
-            "ارزیابی session واقعی از DB. فقط JSON معتبر طبق schema برگردان.\n\n"
-            + json.dumps(payload, ensure_ascii=False)
-        )
+        user_text = intro + json.dumps(payload, ensure_ascii=False)
         data = MessageRequest(
             message=MessageContent(type="USER", content=user_text),
         )
@@ -128,13 +89,13 @@ def send_evaluator_request(
             pass
 
 
-def parse_json_from_llm(text: str) -> dict[str, Any]:
+def extract_revised_prompt(text: str) -> str:
+    """Pull the revised system prompt from a plain-text LLM reply."""
     cleaned = text.strip()
-    fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL | re.IGNORECASE)
+    fence = re.search(r"```(?:text|markdown)?\s*(.*?)```", cleaned, re.DOTALL | re.IGNORECASE)
     if fence:
         cleaned = fence.group(1).strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("Evaluator response did not contain JSON object")
-    return json.loads(cleaned[start : end + 1])
+    marker = "\n---RULE_CHANGE---"
+    if marker in cleaned:
+        cleaned = cleaned.split(marker, 1)[0].strip()
+    return cleaned.strip()

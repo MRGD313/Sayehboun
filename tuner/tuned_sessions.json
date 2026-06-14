@@ -1,9 +1,9 @@
 {
   "sessions": {
-    "74": {
-      "tuned_at": "2026-05-31T07:16:55.906524+00:00",
-      "report": "reports/session_74_20260531_071655.json",
-      "prompt_version": "v2"
+    "82": {
+      "tuned_at": "2026-06-13T06:09:55.849484+00:00",
+      "report": "reports/session_82_20260613_060955.json",
+      "prompt_version": "v3"
     }
   }
 }
