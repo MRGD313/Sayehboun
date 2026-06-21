@@ -226,19 +226,28 @@ class DeepSeekClient:
         chief_complaint: str,
         demographics: dict[str, Any],
         session_messages: list[dict[str, Any]],
+        followup_context: dict[str, Any] | None = None,
     ) -> str:
         clean_demographics = {
             key: value
             for key, value in demographics.items()
             if not str(key).startswith("_")
         }
-        payload = {
+        instruction = "فقط سوالات فاز فعلی را مطابق قوانین تولید کن."
+        if followup_context:
+            instruction = (
+                f"{followup_context.get('instruction_fa', '')} "
+                "فقط سوالات فاز فعلی را مطابق قوانین تولید کن."
+            )
+        payload: dict[str, Any] = {
             "current_phase": current_phase,
             "chief_complaint": chief_complaint,
             "demographics": clean_demographics,
             "session_messages": session_messages,
-            "instruction": "فقط سوالات فاز فعلی را مطابق قوانین تولید کن.",
+            "instruction": instruction,
         }
+        if followup_context:
+            payload["followup_context"] = followup_context
 
         # In Metis Bot mode, core instructions are configured in bot panel.
         # Send only compact dynamic data to avoid token waste/truncation.

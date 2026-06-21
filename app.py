@@ -3,14 +3,39 @@ import os
 import re
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 import msvcrt
 import requests
 from dotenv import load_dotenv
 
-from db import Database, JudgmentReview
+from db import Database, Followup, JudgmentReview
 from deepseek_client import DeepSeekClient
+from doctor_profile import format_judgment_for_patient, resolve_reviewing_doctor, strip_patient_approval_header
+from followup import (
+    CLOSING_ESCALATION_INTRO,
+    FOLLOWUP_USE_BUTTONS,
+    build_intro,
+    build_redflag_question,
+    build_closing_message,
+    build_followup_ai_context,
+    compute_due_at,
+    doctor_schedule_message,
+    DOCTOR_FOLLOWUP_ESCALATION_BANNER,
+    format_followup_context_text,
+    session_has_followup,
+    followup_poll_interval_sec,
+    is_followup_test_mode,
+    needs_doctor_visit,
+    parse_redflag_callback,
+    parse_trend_callback,
+    parse_urgency_class,
+    redflag_keyboard,
+    should_escalate,
+    trend_keyboard,
+    trend_label,
+)
 from history_formatter import MetisHistoryFormatterClient
 from judging_client import MetisJudgingClient
 from metis_utils import apply_metis_direct_network, check_metis_network, metis_log
@@ -84,6 +109,11 @@ def _maybe_register_doctor(db: Database, message: dict) -> None:
         doctor_chat_id = str(sender.get("id") or "").strip()
         if doctor_chat_id:
             db.set_doctor_chat_id(doctor_chat_id)
+            doctor = db.get_doctor_by_bale_chat_id(doctor_chat_id)
+            if not doctor:
+                active = db.get_active_doctor()
+                if active and not active.bale_chat_id:
+                    db.link_doctor_bale_chat_id(active.id, doctor_chat_id)
 
 
 def _resolve_doctor_chat_id(db: Database) -> str:
@@ -100,19 +130,34 @@ def _build_session_payload(
     chief_complaint: str,
     demographics: dict[str, str],
     messages: list[dict[str, str]],
+    followup_context: dict | None = None,
 ) -> str:
     demo_lines = [f"{key}: {value}" for key, value in demographics.items() if not key.startswith("_")]
     message_lines = [
         f"[{item.get('role', 'unknown')}] {item.get('text', '')}" for item in messages
     ]
-    return (
-        f"patient_chat_id: {patient_chat_id}\n"
-        f"session_id: {session_id}\n"
-        f"chief_complaint: {chief_complaint}\n\n"
-        "demographics:\n"
-        + "\n".join(demo_lines)
-        + "\n\nsession_messages:\n"
-        + "\n".join(message_lines)
+    parts = [
+        f"patient_chat_id: {patient_chat_id}",
+        f"session_id: {session_id}",
+        f"chief_complaint: {chief_complaint}",
+        "",
+        "demographics:",
+        "\n".join(demo_lines),
+    ]
+    if followup_context:
+        parts.extend(["", format_followup_context_text(followup_context), ""])
+    parts.extend(["session_messages:", "\n".join(message_lines)])
+    return "\n".join(parts)
+
+
+def _followup_context_for_session(db: Database, session_id: int, messages: list[dict]) -> dict | None:
+    if not session_has_followup(messages):
+        return None
+    row = db.get_followup(session_id)
+    return build_followup_ai_context(
+        messages,
+        urgency_class=row.urgency_class if row else "",
+        trend=row.trend if row else "",
     )
 
 
@@ -154,11 +199,16 @@ def _send_doctor_report(
     session_id: int,
     session_time: str,
     body: str,
+    followup_escalation: bool = False,
 ) -> None:
+    banner = ""
+    if followup_escalation:
+        banner = f"{DOCTOR_FOLLOWUP_ESCALATION_BANNER}\n\n"
     header = (
         f"pid: {patient_chat_id}\n"
         f"sid: {session_id}\n"
         f"time: {session_time}\n\n"
+        f"{banner}"
         f"{body}"
     )
     _send_text(token, doctor_chat_id, header)
@@ -182,12 +232,15 @@ def _complete_session_and_notify_doctor(
         return
 
     doctor_chat_id = _resolve_doctor_chat_id(db)
+    followup_escalation = session_has_followup(session.messages)
+    followup_context = _followup_context_for_session(db, session_id, session.messages)
     payload = _build_session_payload(
         patient_chat_id=patient_chat_id,
         session_id=session_id,
         chief_complaint=session.chief_complaint,
         demographics=demographics,
         messages=session.messages,
+        followup_context=followup_context,
     )
 
     try:
@@ -201,6 +254,7 @@ def _complete_session_and_notify_doctor(
                 session_id=session_id,
                 session_time=session.created_at,
                 body=DOCTOR_FORMATTER_ERROR,
+                followup_escalation=followup_escalation,
             )
         return
 
@@ -213,6 +267,7 @@ def _complete_session_and_notify_doctor(
                 session_id=session_id,
                 session_time=session.created_at,
                 body=DOCTOR_FORMATTER_ERROR,
+                followup_escalation=followup_escalation,
             )
         return
 
@@ -225,6 +280,7 @@ def _complete_session_and_notify_doctor(
             session_id=session_id,
             session_time=session.created_at,
             body=structured,
+            followup_escalation=followup_escalation,
         )
 
     try:
@@ -239,6 +295,7 @@ def _complete_session_and_notify_doctor(
                 session_id=session_id,
                 session_time=session.created_at,
                 body=DOCTOR_JUDGING_ERROR,
+                followup_escalation=followup_escalation,
             )
         return
 
@@ -251,6 +308,7 @@ def _complete_session_and_notify_doctor(
                 session_id=session_id,
                 session_time=session.created_at,
                 body=DOCTOR_JUDGING_ERROR,
+                followup_escalation=followup_escalation,
             )
         return
 
@@ -264,6 +322,7 @@ def _complete_session_and_notify_doctor(
             session_id=session_id,
             session_time=session.created_at,
             judgment=judgment,
+            followup_escalation=followup_escalation,
         )
 
 
@@ -278,6 +337,7 @@ def _send_phase_questions(
     chief_complaint: str,
     demographics: dict[str, str],
     session_messages: list[dict[str, str]],
+    followup_context: dict | None = None,
 ) -> None:
     metis_log(
         "bot",
@@ -295,6 +355,7 @@ def _send_phase_questions(
         chief_complaint=chief_complaint,
         demographics=demographics,
         session_messages=session_messages,
+        followup_context=followup_context,
     )
     if not questions_text:
         metis_log("bot", "phase_questions_empty_response", session_id=session_id, phase=phase)
@@ -449,13 +510,18 @@ def _send_doctor_judgment_for_review(
     session_id: int,
     session_time: str,
     judgment: str,
+    followup_escalation: bool = False,
 ) -> None:
     db.upsert_judgment_review(session_id, patient_chat_id, judgment)
     db.set_doctor_active_review_session(session_id)
+    banner = ""
+    if followup_escalation:
+        banner = f"{DOCTOR_FOLLOWUP_ESCALATION_BANNER}\n\n"
     header = (
         f"pid: {patient_chat_id}\n"
         f"sid: {session_id}\n"
         f"time: {session_time}\n\n"
+        f"{banner}"
         f"{judgment}\n\n"
         f"{DOCTOR_REVIEW_HINT}"
     )
@@ -478,6 +544,10 @@ def _strip_doctor_report_header(text: str) -> str:
         cleaned,
         count=1,
     )
+    if DOCTOR_FOLLOWUP_ESCALATION_BANNER in cleaned:
+        cleaned = cleaned.replace(f"{DOCTOR_FOLLOWUP_ESCALATION_BANNER}\n\n", "")
+        cleaned = cleaned.replace(DOCTOR_FOLLOWUP_ESCALATION_BANNER, "")
+    cleaned = strip_patient_approval_header(cleaned)
     if DOCTOR_REVIEW_HINT in cleaned:
         cleaned = cleaned.replace(DOCTOR_REVIEW_HINT, "").strip()
     return cleaned.strip()
@@ -490,11 +560,266 @@ def _deliver_judgment_to_patient(
     session_id: int,
     patient_chat_id: str,
     text: str,
+    doctor_bale_chat_id: str = "",
 ) -> None:
-    patient_text = _strip_doctor_report_header(text)
+    judgment_body = _strip_doctor_report_header(text)
+    doctor = resolve_reviewing_doctor(db, doctor_bale_chat_id)
+    patient_text = format_judgment_for_patient(judgment_body, doctor)
     _send_text(token, patient_chat_id, patient_text, reply_markup=_chat_keyboard())
     db.append_message(session_id, "judgment_to_patient", patient_text)
     db.set_judgment_review_status(session_id, "sent")
+    _schedule_followup_after_delivery(
+        db,
+        token=token,
+        session_id=session_id,
+        patient_chat_id=patient_chat_id,
+        judgment_text=patient_text,
+    )
+
+
+def _schedule_followup_after_delivery(
+    db: Database,
+    *,
+    token: str,
+    session_id: int,
+    patient_chat_id: str,
+    judgment_text: str,
+) -> None:
+    if not needs_doctor_visit(judgment_text):
+        return
+    urgency_class = parse_urgency_class(judgment_text)
+    due_at = compute_due_at(urgency_class)
+    db.create_followup(session_id, patient_chat_id, due_at, urgency_class)
+    doctor_chat_id = _resolve_doctor_chat_id(db)
+    if doctor_chat_id:
+        _send_text(
+            token,
+            doctor_chat_id,
+            doctor_schedule_message(session_id, urgency_class),
+        )
+
+
+def _judgment_to_patient_text(session_messages: list[dict[str, str]]) -> str:
+    for item in reversed(session_messages):
+        if item.get("role") == "judgment_to_patient":
+            return (item.get("text") or "").strip()
+    return ""
+
+
+def _start_followup_conversation(
+    db: Database,
+    *,
+    token: str,
+    followup: Followup,
+) -> None:
+    session = db.get_session_by_id(followup.session_id)
+    if not session:
+        db.update_followup(followup.session_id, status="cancelled")
+        return
+    latest = db.get_latest_session(followup.patient_chat_id)
+    if not latest or latest.id != followup.session_id:
+        db.update_followup(followup.session_id, status="cancelled")
+        return
+    if not db.try_claim_due_followup(followup.session_id):
+        return
+    intro = build_intro(session.chief_complaint)
+    _send_text(
+        token,
+        followup.patient_chat_id,
+        intro,
+        reply_markup=trend_keyboard(followup.session_id),
+    )
+    db.append_message(followup.session_id, "followup_bot", intro)
+
+
+def _process_due_followups(db: Database, *, token: str) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for followup in db.get_due_followups(now_iso):
+        try:
+            _start_followup_conversation(db, token=token, followup=followup)
+        except Exception as err:
+            metis_log(
+                "bot",
+                "followup_start_error",
+                session_id=followup.session_id,
+                error=str(err)[:300],
+            )
+
+
+def _send_followup_redflag_question(
+    db: Database,
+    *,
+    token: str,
+    session_id: int,
+    patient_chat_id: str,
+) -> None:
+    session = db.get_session_by_id(session_id)
+    if not session:
+        return
+    judgment_text = _judgment_to_patient_text(session.messages)
+    question = build_redflag_question(judgment_text)
+    _send_text(
+        token,
+        patient_chat_id,
+        question,
+        reply_markup=redflag_keyboard(session_id),
+    )
+    db.append_message(session_id, "followup_bot", question)
+    db.update_followup(session_id, step="redflag")
+
+
+def _complete_followup(
+    db: Database,
+    *,
+    token: str,
+    session_id: int,
+    patient_chat_id: str,
+    trend: str = "",
+) -> None:
+    closing = build_closing_message(trend)
+    _send_text(token, patient_chat_id, closing, reply_markup=_chat_keyboard())
+    db.append_message(session_id, "followup_bot", closing)
+    db.update_followup(session_id, status="completed", step="")
+
+
+def _escalate_followup_to_triage(
+    db: Database,
+    deepseek: DeepSeekClient,
+    *,
+    token: str,
+    patient_chat_id: str,
+    session_id: int,
+) -> None:
+    db.update_followup(session_id, status="escalated", step="")
+    db.update_session(
+        session_id,
+        current_phase=1,
+        waiting_for_continue=0,
+        answer_buffer=[],
+        pending_field="",
+    )
+    deepseek.reset_session(patient_chat_id)
+    _send_text(
+        token,
+        patient_chat_id,
+        CLOSING_ESCALATION_INTRO,
+        reply_markup=_chat_keyboard(),
+    )
+    db.append_message(session_id, "followup_bot", CLOSING_ESCALATION_INTRO)
+    session = db.get_session_by_id(session_id)
+    if not session:
+        return
+    demographics = db.get_demographics(patient_chat_id)
+    followup_context = _followup_context_for_session(db, session_id, session.messages)
+    _send_phase_questions(
+        db,
+        deepseek,
+        token=token,
+        chat_id=patient_chat_id,
+        session_id=session_id,
+        phase=1,
+        chief_complaint=session.chief_complaint,
+        demographics=demographics,
+        session_messages=session.messages,
+        followup_context=followup_context,
+    )
+
+
+def _process_followup_callback(
+    db: Database,
+    deepseek: DeepSeekClient,
+    formatter: MetisHistoryFormatterClient,
+    judging: MetisJudgingClient,
+    *,
+    token: str,
+    callback_query: dict,
+) -> None:
+    callback_id = str(callback_query.get("id") or "")
+    data = str(callback_query.get("data") or "").strip()
+    sender = callback_query.get("from") or callback_query.get("from_user") or {}
+    patient_chat_id = str(sender.get("id") or "").strip()
+    if not callback_id or not data or not patient_chat_id:
+        return
+
+    trend_parsed = parse_trend_callback(data)
+    if trend_parsed:
+        session_id, trend = trend_parsed
+        followup = db.get_followup(session_id)
+        if (
+            not followup
+            or followup.patient_chat_id != patient_chat_id
+            or followup.status != "in_progress"
+            or followup.step != "trend"
+        ):
+            _answer_callback_query(token, callback_id, text="پیگیری فعال نیست.")
+            return
+        label = trend_label(trend)
+        db.append_message(session_id, "followup_user", label)
+        db.update_followup(session_id, trend=trend, step="redflag")
+        _answer_callback_query(token, callback_id, text="ثبت شد")
+        _send_followup_redflag_question(
+            db,
+            token=token,
+            session_id=session_id,
+            patient_chat_id=patient_chat_id,
+        )
+        return
+
+    redflag_parsed = parse_redflag_callback(data)
+    if redflag_parsed:
+        session_id, has_redflag = redflag_parsed
+        followup = db.get_followup(session_id)
+        if (
+            not followup
+            or followup.patient_chat_id != patient_chat_id
+            or followup.status != "in_progress"
+            or followup.step != "redflag"
+        ):
+            _answer_callback_query(token, callback_id, text="پیگیری فعال نیست.")
+            return
+        answer = "بله، دارم" if has_redflag else "خیر، ندارم"
+        db.append_message(session_id, "followup_user", answer)
+        _answer_callback_query(token, callback_id, text="ثبت شد")
+        if should_escalate(trend=followup.trend, redflag=has_redflag):
+            _escalate_followup_to_triage(
+                db,
+                deepseek,
+                token=token,
+                patient_chat_id=patient_chat_id,
+                session_id=session_id,
+            )
+        else:
+            _complete_followup(
+                db,
+                token=token,
+                session_id=session_id,
+                patient_chat_id=patient_chat_id,
+                trend=followup.trend,
+            )
+        return
+
+
+def _process_callback_query(
+    db: Database,
+    deepseek: DeepSeekClient,
+    formatter: MetisHistoryFormatterClient,
+    judging: MetisJudgingClient,
+    *,
+    token: str,
+    callback_query: dict,
+) -> None:
+    data = str(callback_query.get("data") or "").strip()
+    if data.startswith("fu:"):
+        _process_followup_callback(
+            db,
+            deepseek,
+            formatter,
+            judging,
+            token=token,
+            callback_query=callback_query,
+        )
+        return
+    _process_judgment_callback(db, token=token, callback_query=callback_query)
 
 
 def _send_judgment_to_patient_from_review(
@@ -512,6 +837,7 @@ def _send_judgment_to_patient_from_review(
         session_id=review.session_id,
         patient_chat_id=review.patient_chat_id,
         text=text,
+        doctor_bale_chat_id=_resolve_doctor_chat_id(db),
     )
     return True
 
@@ -630,6 +956,7 @@ def _begin_patient_session(
     chat_id: str,
     user_label: str,
 ) -> None:
+    db.cancel_followups_for_chat(chat_id)
     deepseek.reset_session(chat_id)
     session_id = db.create_session(chat_id)
     db.append_message(session_id, "user", user_label)
@@ -705,6 +1032,20 @@ def _process_text_message(
             chat_id=chat_id,
             user_label=text,
         )
+        return
+
+    active_followup = db.get_active_followup_for_chat(chat_id)
+    if active_followup and active_followup.status == "in_progress":
+        db.append_message(active_followup.session_id, "followup_user", text)
+        _send_text(
+            token,
+            chat_id,
+            FOLLOWUP_USE_BUTTONS,
+            reply_markup=trend_keyboard(active_followup.session_id)
+            if active_followup.step == "trend"
+            else redflag_keyboard(active_followup.session_id),
+        )
+        db.append_message(active_followup.session_id, "followup_bot", FOLLOWUP_USE_BUTTONS)
         return
 
     latest_session_id = _get_or_create_latest_session_id(db, chat_id)
@@ -911,12 +1252,23 @@ def main() -> None:
     print(f"History taker prompt version: {prompt_version}", flush=True)
 
     check_metis_network()
+    if is_followup_test_mode():
+        print(
+            "Follow-up TEST MODE: emergency=10s, urgent=1m, routine=5m (poll every 5s)",
+            flush=True,
+        )
     print("Bale bot is running (HTTP long polling).", flush=True)
     offset: int | None = None
+    last_followup_poll = 0.0
 
     try:
         while True:
             try:
+                now_mono = time.monotonic()
+                if now_mono - last_followup_poll >= followup_poll_interval_sec():
+                    _process_due_followups(db, token=token)
+                    last_followup_poll = now_mono
+
                 payload: dict[str, int] = {"timeout": 30}
                 if offset is not None:
                     payload["offset"] = offset
@@ -938,8 +1290,13 @@ def main() -> None:
                     callback_query = update.get("callback_query")
                     if callback_query:
                         try:
-                            _process_judgment_callback(
-                                db, token=token, callback_query=callback_query
+                            _process_callback_query(
+                                db,
+                                deepseek,
+                                formatter,
+                                judging,
+                                token=token,
+                                callback_query=callback_query,
                             )
                         except Exception as err:
                             metis_log("bot", "callback_error", error=str(err)[:300])

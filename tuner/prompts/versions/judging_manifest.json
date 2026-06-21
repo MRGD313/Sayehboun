@@ -1,5 +1,5 @@
 {
-  "current": "v3",
+  "current": "v4",
   "versions": {
     "v1": {
       "file": "judging_v1.txt",
@@ -17,6 +17,12 @@
       "file": "judging_v3.txt",
       "created_at": "2026-06-14",
       "note": "4 Paziresh24 URL patterns by urgency (urgent/not) and visit type (online/physical)",
+      "applied_to_metis": true
+    },
+    "v4": {
+      "file": "judging_v4.txt",
+      "created_at": "2026-06-21",
+      "note": "Explicit emergency vs urgent clinical rules (ACS/chest pain); item 2 only for follow-up parsing",
       "applied_to_metis": true
     }
   }

@@ -33,6 +33,30 @@ class JudgmentReview:
     updated_at: str
 
 
+@dataclass
+class Followup:
+    session_id: int
+    patient_chat_id: str
+    due_at: str
+    urgency_class: str
+    status: str
+    step: str
+    trend: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class Doctor:
+    id: int
+    display_name: str
+    medical_council_code: str
+    bale_chat_id: str
+    is_active: int
+    created_at: str
+    updated_at: str
+
+
 class Database:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -111,6 +135,64 @@ class Database:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS followups (
+                    session_id INTEGER PRIMARY KEY,
+                    patient_chat_id TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    urgency_class TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'scheduled',
+                    step TEXT NOT NULL DEFAULT '',
+                    trend TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_followups_status_due
+                ON followups(status, due_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS doctors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    display_name TEXT NOT NULL,
+                    medical_council_code TEXT NOT NULL DEFAULT '',
+                    bale_chat_id TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_doctors_medical_code
+                ON doctors(medical_council_code)
+                WHERE medical_council_code != ''
+                """
+            )
+            self._seed_default_doctors(conn)
+
+    def _seed_default_doctors(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute("SELECT COUNT(*) AS n FROM doctors").fetchone()
+        if row and int(row["n"]) > 0:
+            return
+        now = _now_iso()
+        conn.execute(
+            """
+            INSERT INTO doctors(
+                display_name, medical_council_code, bale_chat_id,
+                is_active, created_at, updated_at
+            )
+            VALUES (?, ?, '', 1, ?, ?)
+            """,
+            ("دکتر محمدرضا گنج دانش", "214433", now, now),
+        )
 
     def get_demographics(self, chat_id: str) -> dict[str, Any]:
         with self.connect() as conn:
@@ -400,4 +482,275 @@ class Database:
             return None
         raw = str(row["value"]).strip()
         return int(raw) if raw.isdigit() else None
+
+    def _row_to_followup(self, row: sqlite3.Row) -> Followup:
+        return Followup(
+            session_id=int(row["session_id"]),
+            patient_chat_id=row["patient_chat_id"],
+            due_at=row["due_at"],
+            urgency_class=row["urgency_class"],
+            status=row["status"],
+            step=row["step"],
+            trend=row["trend"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def create_followup(
+        self,
+        session_id: int,
+        patient_chat_id: str,
+        due_at: str,
+        urgency_class: str,
+    ) -> None:
+        now = _now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO followups(
+                    session_id, patient_chat_id, due_at, urgency_class,
+                    status, step, trend, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'scheduled', '', '', ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    patient_chat_id = excluded.patient_chat_id,
+                    due_at = excluded.due_at,
+                    urgency_class = excluded.urgency_class,
+                    status = 'scheduled',
+                    step = '',
+                    trend = '',
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, patient_chat_id, due_at, urgency_class, now, now),
+            )
+
+    def get_followup(self, session_id: int) -> Followup | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT session_id, patient_chat_id, due_at, urgency_class,
+                       status, step, trend, created_at, updated_at
+                FROM followups
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_followup(row)
+
+    def get_active_followup_for_chat(self, patient_chat_id: str) -> Followup | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT session_id, patient_chat_id, due_at, urgency_class,
+                       status, step, trend, created_at, updated_at
+                FROM followups
+                WHERE patient_chat_id = ?
+                  AND status IN ('scheduled', 'in_progress')
+                ORDER BY session_id DESC
+                LIMIT 1
+                """,
+                (patient_chat_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_followup(row)
+
+    def get_due_followups(self, now_iso: str) -> list[Followup]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, patient_chat_id, due_at, urgency_class,
+                       status, step, trend, created_at, updated_at
+                FROM followups
+                WHERE status = 'scheduled' AND due_at <= ?
+                ORDER BY due_at ASC
+                """,
+                (now_iso,),
+            ).fetchall()
+        return [self._row_to_followup(row) for row in rows]
+
+    def update_followup(
+        self,
+        session_id: int,
+        *,
+        status: str | None = None,
+        step: str | None = None,
+        trend: str | None = None,
+    ) -> None:
+        updates: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if step is not None:
+            updates.append("step = ?")
+            params.append(step)
+        if trend is not None:
+            updates.append("trend = ?")
+            params.append(trend)
+        if not updates:
+            return
+        updates.append("updated_at = ?")
+        params.append(_now_iso())
+        params.append(session_id)
+        set_clause = ", ".join(updates)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE followups SET {set_clause} WHERE session_id = ?",
+                tuple(params),
+            )
+
+    def try_claim_due_followup(self, session_id: int) -> bool:
+        """Atomically move scheduled -> in_progress (trend step)."""
+        now = _now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE followups
+                SET status = 'in_progress', step = 'trend', updated_at = ?
+                WHERE session_id = ? AND status = 'scheduled'
+                """,
+                (now, session_id),
+            )
+            return cursor.rowcount > 0
+
+    def cancel_followups_for_chat(self, patient_chat_id: str) -> None:
+        now = _now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE followups
+                SET status = 'cancelled', updated_at = ?
+                WHERE patient_chat_id = ?
+                  AND status IN ('scheduled', 'in_progress')
+                """,
+                (now, patient_chat_id),
+            )
+
+    def _row_to_doctor(self, row: sqlite3.Row) -> Doctor:
+        return Doctor(
+            id=int(row["id"]),
+            display_name=row["display_name"],
+            medical_council_code=row["medical_council_code"],
+            bale_chat_id=row["bale_chat_id"] or "",
+            is_active=int(row["is_active"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def upsert_doctor(
+        self,
+        *,
+        display_name: str,
+        medical_council_code: str = "",
+        bale_chat_id: str = "",
+        is_active: int = 1,
+        doctor_id: int | None = None,
+    ) -> int:
+        now = _now_iso()
+        with self.connect() as conn:
+            if doctor_id is not None:
+                conn.execute(
+                    """
+                    UPDATE doctors
+                    SET display_name = ?, medical_council_code = ?,
+                        bale_chat_id = ?, is_active = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        display_name,
+                        medical_council_code,
+                        bale_chat_id,
+                        is_active,
+                        now,
+                        doctor_id,
+                    ),
+                )
+                return doctor_id
+            cursor = conn.execute(
+                """
+                INSERT INTO doctors(
+                    display_name, medical_council_code, bale_chat_id,
+                    is_active, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (display_name, medical_council_code, bale_chat_id, is_active, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def get_doctor_by_id(self, doctor_id: int) -> Doctor | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, display_name, medical_council_code, bale_chat_id,
+                       is_active, created_at, updated_at
+                FROM doctors WHERE id = ?
+                """,
+                (doctor_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_doctor(row)
+
+    def get_doctor_by_bale_chat_id(self, bale_chat_id: str) -> Doctor | None:
+        chat_id = bale_chat_id.strip()
+        if not chat_id:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, display_name, medical_council_code, bale_chat_id,
+                       is_active, created_at, updated_at
+                FROM doctors
+                WHERE bale_chat_id = ? AND is_active = 1
+                LIMIT 1
+                """,
+                (chat_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_doctor(row)
+
+    def get_active_doctor(self) -> Doctor | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, display_name, medical_council_code, bale_chat_id,
+                       is_active, created_at, updated_at
+                FROM doctors
+                WHERE is_active = 1
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_doctor(row)
+
+    def link_doctor_bale_chat_id(self, doctor_id: int, bale_chat_id: str) -> None:
+        now = _now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE doctors
+                SET bale_chat_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (bale_chat_id.strip(), now, doctor_id),
+            )
+
+    def list_doctors(self) -> list[Doctor]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, display_name, medical_council_code, bale_chat_id,
+                       is_active, created_at, updated_at
+                FROM doctors
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        return [self._row_to_doctor(row) for row in rows]
 
