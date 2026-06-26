@@ -640,6 +640,11 @@ class Database:
             updated_at=row["updated_at"],
         )
 
+    _DOCTOR_COLUMNS = (
+        "id, display_name, medical_council_code, bale_chat_id, "
+        "is_active, created_at, updated_at"
+    )
+
     def upsert_doctor(
         self,
         *,
@@ -677,16 +682,22 @@ class Database:
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (display_name, medical_council_code, bale_chat_id, is_active, now, now),
+                (
+                    display_name,
+                    medical_council_code,
+                    bale_chat_id,
+                    is_active,
+                    now,
+                    now,
+                ),
             )
             return int(cursor.lastrowid)
 
     def get_doctor_by_id(self, doctor_id: int) -> Doctor | None:
         with self.connect() as conn:
             row = conn.execute(
-                """
-                SELECT id, display_name, medical_council_code, bale_chat_id,
-                       is_active, created_at, updated_at
+                f"""
+                SELECT {self._DOCTOR_COLUMNS}
                 FROM doctors WHERE id = ?
                 """,
                 (doctor_id,),
@@ -701,9 +712,8 @@ class Database:
             return None
         with self.connect() as conn:
             row = conn.execute(
-                """
-                SELECT id, display_name, medical_council_code, bale_chat_id,
-                       is_active, created_at, updated_at
+                f"""
+                SELECT {self._DOCTOR_COLUMNS}
                 FROM doctors
                 WHERE bale_chat_id = ? AND is_active = 1
                 LIMIT 1
@@ -717,9 +727,8 @@ class Database:
     def get_active_doctor(self) -> Doctor | None:
         with self.connect() as conn:
             row = conn.execute(
-                """
-                SELECT id, display_name, medical_council_code, bale_chat_id,
-                       is_active, created_at, updated_at
+                f"""
+                SELECT {self._DOCTOR_COLUMNS}
                 FROM doctors
                 WHERE is_active = 1
                 ORDER BY id ASC
@@ -745,9 +754,8 @@ class Database:
     def list_doctors(self) -> list[Doctor]:
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT id, display_name, medical_council_code, bale_chat_id,
-                       is_active, created_at, updated_at
+                f"""
+                SELECT {self._DOCTOR_COLUMNS}
                 FROM doctors
                 ORDER BY id ASC
                 """
