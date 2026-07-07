@@ -76,6 +76,7 @@ DOCTOR_EDIT_BUTTON = "✏️ ویرایش"
 DOCTOR_REVIEW_HINT = "👍🏻 = ارسال به بیمار | ✏️ ویرایش = ویرایش و ارسال"
 JUDGMENT_APPROVE_CALLBACK_PREFIX = "judgment:approve:"
 JUDGMENT_EDIT_CALLBACK_PREFIX = "judgment:edit:"
+PATIENT_RESTART_CALLBACK = "pt:restart"
 PHASE3_ENDING_MESSAGE = "لطفاً به این موارد پاسخ دهید تا اطلاعات شما برای بررسی نهایی آماده شود."
 DEEPSEEK_ERROR_MESSAGE = "شرمنده ... ظاهرا مشکلی پیش آمده است..لطفا کمی بعد دوباره تلاش کنید"
 AI_WAIT_MESSAGE = "در حال آماده‌سازی سوالات... لطفاً چند لحظه صبر کنید."
@@ -491,6 +492,57 @@ def _doctor_judgment_keyboard() -> dict:
     }
 
 
+def _reply_keyboard_remove() -> dict:
+    return {"remove_keyboard": True}
+
+
+def _patient_restart_inline_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": RESTART_BUTTON_TEXT, "callback_data": PATIENT_RESTART_CALLBACK}]
+        ]
+    }
+
+
+def _attach_inline_keyboard(
+    token: str,
+    chat_id: str,
+    message_id: int,
+    reply_markup: dict,
+) -> None:
+    try:
+        response = _http.post(
+            f"https://tapi.bale.ai/bot{token}/editMessageReplyMarkup",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": reply_markup,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except Exception as err:
+        metis_log(
+            "bot",
+            "attach_inline_keyboard_failed",
+            chat_id=chat_id,
+            message_id=message_id,
+            error=str(err)[:200],
+        )
+
+
+def _send_patient_post_flow_message(token: str, chat_id: str, text: str) -> int | None:
+    """Remove reply keyboard, then attach inline شروع مجدد only."""
+    message_id = _send_text(token, chat_id, text, reply_markup=_reply_keyboard_remove())
+    if message_id is not None:
+        _attach_inline_keyboard(token, chat_id, message_id, _patient_restart_inline_keyboard())
+    return message_id
+
+
+def _send_doctor_idle_message(token: str, doctor_chat_id: str, text: str) -> None:
+    _send_text(token, doctor_chat_id, text, reply_markup=_reply_keyboard_remove())
+
+
 def _judgment_review_keyboard(session_id: int) -> dict:
     """Inline fallback (Bale answerCallbackQuery may fail on some clients)."""
     return {
@@ -527,10 +579,10 @@ def _approve_judgment_review(
 ) -> None:
     review = db.get_judgment_review(session_id)
     if not review:
-        _send_text(token, doctor_chat_id, "یافت نشد.")
+        _send_doctor_idle_message(token, doctor_chat_id, "یافت نشد.")
         return
     if review.status == "sent":
-        _send_text(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
+        _send_doctor_idle_message(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
         return
     if _send_judgment_to_patient_from_review(
         db,
@@ -538,9 +590,9 @@ def _approve_judgment_review(
         review=review,
         text=review.judgment_text,
     ):
-        _send_text(token, doctor_chat_id, DOCTOR_SENT_TO_PATIENT_ACK)
+        _send_doctor_idle_message(token, doctor_chat_id, DOCTOR_SENT_TO_PATIENT_ACK)
     else:
-        _send_text(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
+        _send_doctor_idle_message(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
 
 
 def _start_judgment_edit(
@@ -552,18 +604,17 @@ def _start_judgment_edit(
 ) -> None:
     review = db.get_judgment_review(session_id)
     if not review:
-        _send_text(token, doctor_chat_id, "یافت نشد.")
+        _send_doctor_idle_message(token, doctor_chat_id, "یافت نشد.")
         return
     if review.status == "sent":
-        _send_text(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
+        _send_doctor_idle_message(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
         return
     db.set_judgment_review_status(session_id, "editing")
     db.set_doctor_active_review_session(session_id)
-    _send_text(
+    _send_doctor_idle_message(
         token,
         doctor_chat_id,
         f"{DOCTOR_EDIT_PROMPT}\n\nsid: {session_id}",
-        reply_markup=_doctor_judgment_keyboard(),
     )
 
 
@@ -631,7 +682,7 @@ def _deliver_judgment_to_patient(
     judgment_body = _strip_doctor_report_header(text)
     doctor = resolve_reviewing_doctor(db, doctor_bale_chat_id)
     patient_text = format_judgment_for_patient(judgment_body, doctor)
-    _send_text(token, patient_chat_id, patient_text, reply_markup=_chat_keyboard())
+    _send_patient_post_flow_message(token, patient_chat_id, patient_text)
     db.append_message(session_id, "judgment_to_patient", patient_text)
     db.set_judgment_review_status(session_id, "sent")
     _schedule_followup_after_delivery(
@@ -830,12 +881,10 @@ def _complete_nps_survey(
     if comment.strip():
         db.append_message(survey.session_id, "nps_user", comment.strip())
     thanks = build_thanks(survey.survey_type)
-    reply_markup = (
-        _doctor_judgment_keyboard()
-        if survey.survey_type == SURVEY_DOCTOR
-        else _chat_keyboard()
-    )
-    _send_text(token, survey.chat_id, thanks, reply_markup=reply_markup)
+    if survey.survey_type == SURVEY_DOCTOR:
+        _send_doctor_idle_message(token, survey.chat_id, thanks)
+    else:
+        _send_patient_post_flow_message(token, survey.chat_id, thanks)
     db.append_message(survey.session_id, "nps_bot", thanks)
 
 
@@ -967,7 +1016,7 @@ def _complete_followup(
     trend: str = "",
 ) -> None:
     closing = build_closing_message(trend)
-    _send_text(token, patient_chat_id, closing, reply_markup=_chat_keyboard())
+    _send_patient_post_flow_message(token, patient_chat_id, closing)
     db.append_message(session_id, "followup_bot", closing)
     db.update_followup(session_id, status="completed", step="")
 
@@ -1099,6 +1148,20 @@ def _process_callback_query(
     callback_query: dict,
 ) -> None:
     data = str(callback_query.get("data") or "").strip()
+    if data == PATIENT_RESTART_CALLBACK:
+        callback_id = str(callback_query.get("id") or "")
+        sender = callback_query.get("from") or callback_query.get("from_user") or {}
+        patient_chat_id = str(sender.get("id") or "").strip()
+        if callback_id and patient_chat_id:
+            _answer_callback_query(token, callback_id, text="شروع مجدد")
+            _begin_patient_session(
+                db,
+                deepseek,
+                token=token,
+                chat_id=patient_chat_id,
+                user_label=RESTART_BUTTON_TEXT,
+            )
+        return
     if data.startswith("fu:"):
         _process_followup_callback(
             db,
@@ -1146,7 +1209,7 @@ def _process_doctor_review_buttons(
         return False
     review = _get_review_for_doctor_action(db, db.get_doctor_active_review_session_id())
     if not review:
-        _send_text(token, doctor_chat_id, "نظری برای بررسی یافت نشد.")
+        _send_doctor_idle_message(token, doctor_chat_id, "نظری برای بررسی یافت نشد.")
         return True
     if text == DOCTOR_APPROVE_BUTTON:
         _approve_judgment_review(
@@ -1176,7 +1239,7 @@ def _process_doctor_edit_message(
     if not review:
         return False
     if not text.strip():
-        _send_text(token, doctor_chat_id, "متن خالی است. دوباره ارسال کنید.")
+        _send_doctor_idle_message(token, doctor_chat_id, "متن خالی است. دوباره ارسال کنید.")
         return True
     if _send_judgment_to_patient_from_review(
         db,
@@ -1184,9 +1247,9 @@ def _process_doctor_edit_message(
         review=review,
         text=text.strip(),
     ):
-        _send_text(token, doctor_chat_id, DOCTOR_SENT_TO_PATIENT_ACK)
+        _send_doctor_idle_message(token, doctor_chat_id, DOCTOR_SENT_TO_PATIENT_ACK)
     else:
-        _send_text(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
+        _send_doctor_idle_message(token, doctor_chat_id, DOCTOR_ALREADY_SENT_ACK)
     return True
 
 
