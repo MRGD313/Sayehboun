@@ -47,6 +47,23 @@ class Followup:
 
 
 @dataclass
+class NpsSurvey:
+    id: int
+    session_id: int
+    chat_id: str
+    survey_type: str
+    trigger_event: str
+    due_at: str
+    status: str
+    step: str
+    score: int | None
+    comment: str
+    inline_message_id: int | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass
 class Doctor:
     id: int
     display_name: str
@@ -158,6 +175,43 @@ class Database:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS nps_surveys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    survey_type TEXT NOT NULL,
+                    trigger_event TEXT NOT NULL,
+                    due_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'scheduled',
+                    step TEXT NOT NULL DEFAULT '',
+                    score INTEGER,
+                    comment TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(session_id, survey_type)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_nps_status_due
+                ON nps_surveys(status, due_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_nps_chat_type_created
+                ON nps_surveys(chat_id, survey_type, created_at)
+                """
+            )
+            try:
+                conn.execute(
+                    "ALTER TABLE nps_surveys ADD COLUMN inline_message_id INTEGER"
+                )
+            except sqlite3.OperationalError:
+                pass
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS doctors (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     display_name TEXT NOT NULL,
@@ -177,6 +231,25 @@ class Database:
                 """
             )
             self._seed_default_doctors(conn)
+
+    def _row_to_nps_survey(self, row: sqlite3.Row) -> NpsSurvey:
+        score_raw = row["score"]
+        inline_raw = row["inline_message_id"] if "inline_message_id" in row.keys() else None
+        return NpsSurvey(
+            id=int(row["id"]),
+            session_id=int(row["session_id"]),
+            chat_id=row["chat_id"],
+            survey_type=row["survey_type"],
+            trigger_event=row["trigger_event"],
+            due_at=row["due_at"],
+            status=row["status"],
+            step=row["step"],
+            score=int(score_raw) if score_raw is not None else None,
+            comment=row["comment"] or "",
+            inline_message_id=int(inline_raw) if inline_raw is not None else None,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     def _seed_default_doctors(self, conn: sqlite3.Connection) -> None:
         row = conn.execute("SELECT COUNT(*) AS n FROM doctors").fetchone()
@@ -627,6 +700,193 @@ class Database:
                   AND status IN ('scheduled', 'in_progress')
                 """,
                 (now, patient_chat_id),
+            )
+
+    def _doctor_nps_exists_today(self, conn: sqlite3.Connection, doctor_chat_id: str) -> bool:
+        now = datetime.now(timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        row = conn.execute(
+            """
+            SELECT 1 FROM nps_surveys
+            WHERE chat_id = ? AND survey_type = 'doctor' AND created_at >= ?
+            LIMIT 1
+            """,
+            (doctor_chat_id, start),
+        ).fetchone()
+        return row is not None
+
+    def create_nps_survey(
+        self,
+        session_id: int,
+        chat_id: str,
+        survey_type: str,
+        trigger_event: str,
+        due_at: str,
+    ) -> int | None:
+        now = _now_iso()
+        with self.connect() as conn:
+            if survey_type == "doctor" and self._doctor_nps_exists_today(conn, chat_id):
+                return None
+            cursor = conn.execute(
+                """
+                INSERT INTO nps_surveys(
+                    session_id, chat_id, survey_type, trigger_event, due_at,
+                    status, step, score, comment, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'scheduled', '', NULL, '', ?, ?)
+                ON CONFLICT(session_id, survey_type) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    trigger_event = excluded.trigger_event,
+                    due_at = excluded.due_at,
+                    status = 'scheduled',
+                    step = '',
+                    score = NULL,
+                    comment = '',
+                    updated_at = excluded.updated_at
+                WHERE nps_surveys.status != 'completed'
+                """,
+                (session_id, chat_id, survey_type, trigger_event, due_at, now, now),
+            )
+            if cursor.rowcount == 0:
+                row = conn.execute(
+                    """
+                    SELECT id FROM nps_surveys
+                    WHERE session_id = ? AND survey_type = ?
+                    """,
+                    (session_id, survey_type),
+                ).fetchone()
+                return int(row["id"]) if row else None
+            if cursor.lastrowid:
+                return int(cursor.lastrowid)
+            row = conn.execute(
+                """
+                SELECT id FROM nps_surveys
+                WHERE session_id = ? AND survey_type = ?
+                """,
+                (session_id, survey_type),
+            ).fetchone()
+            return int(row["id"]) if row else None
+
+    def get_nps_survey(self, survey_id: int) -> NpsSurvey | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, session_id, chat_id, survey_type, trigger_event,
+                       due_at, status, step, score, comment, inline_message_id,
+                       created_at, updated_at
+                FROM nps_surveys
+                WHERE id = ?
+                """,
+                (survey_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_nps_survey(row)
+
+    def get_active_nps_for_chat(self, chat_id: str) -> NpsSurvey | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, session_id, chat_id, survey_type, trigger_event,
+                       due_at, status, step, score, comment, inline_message_id,
+                       created_at, updated_at
+                FROM nps_surveys
+                WHERE chat_id = ?
+                  AND status = 'in_progress'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (chat_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_nps_survey(row)
+
+    def get_due_nps_surveys(self, now_iso: str) -> list[NpsSurvey]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, session_id, chat_id, survey_type, trigger_event,
+                       due_at, status, step, score, comment, inline_message_id,
+                       created_at, updated_at
+                FROM nps_surveys
+                WHERE status = 'scheduled' AND due_at <= ?
+                ORDER BY due_at ASC
+                """,
+                (now_iso,),
+            ).fetchall()
+        return [self._row_to_nps_survey(row) for row in rows]
+
+    def try_claim_due_nps_survey(self, survey_id: int) -> bool:
+        now = _now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE nps_surveys
+                SET status = 'in_progress', step = 'score', updated_at = ?
+                WHERE id = ? AND status = 'scheduled'
+                """,
+                (now, survey_id),
+            )
+            return cursor.rowcount > 0
+
+    def update_nps_survey(
+        self,
+        survey_id: int,
+        *,
+        status: str | None = None,
+        step: str | None = None,
+        score: int | None = None,
+        comment: str | None = None,
+        inline_message_id: int | None = None,
+        clear_score: bool = False,
+        clear_inline_message_id: bool = False,
+    ) -> None:
+        updates: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if step is not None:
+            updates.append("step = ?")
+            params.append(step)
+        if clear_score:
+            updates.append("score = NULL")
+        elif score is not None:
+            updates.append("score = ?")
+            params.append(score)
+        if comment is not None:
+            updates.append("comment = ?")
+            params.append(comment)
+        if clear_inline_message_id:
+            updates.append("inline_message_id = NULL")
+        elif inline_message_id is not None:
+            updates.append("inline_message_id = ?")
+            params.append(inline_message_id)
+        if not updates:
+            return
+        updates.append("updated_at = ?")
+        params.append(_now_iso())
+        params.append(survey_id)
+        set_clause = ", ".join(updates)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE nps_surveys SET {set_clause} WHERE id = ?",
+                tuple(params),
+            )
+
+    def cancel_nps_for_chat(self, chat_id: str) -> None:
+        now = _now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE nps_surveys
+                SET status = 'cancelled', updated_at = ?
+                WHERE chat_id = ?
+                  AND survey_type = 'patient'
+                  AND status IN ('scheduled', 'in_progress')
+                """,
+                (now, chat_id),
             )
 
     def _row_to_doctor(self, row: sqlite3.Row) -> Doctor:

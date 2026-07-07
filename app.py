@@ -10,7 +10,7 @@ import msvcrt
 import requests
 from dotenv import load_dotenv
 
-from db import Database, Followup, JudgmentReview
+from db import Database, Followup, JudgmentReview, NpsSurvey
 from deepseek_client import DeepSeekClient
 from doctor_profile import (
     format_judgment_for_patient,
@@ -39,6 +39,26 @@ from followup import (
     should_escalate,
     trend_keyboard,
     trend_label,
+)
+from nps import (
+    DOCTOR_QUESTION,
+    NPS_SKIP_COMMENT,
+    NPS_USE_BUTTONS,
+    PATIENT_QUESTION,
+    SURVEY_DOCTOR,
+    SURVEY_PATIENT,
+    TRIGGER_DOCTOR_REVIEW_SENT,
+    TRIGGER_JUDGMENT_DELIVERED,
+    build_comment_prompt,
+    build_thanks,
+    comment_keyboard,
+    doctor_nps_due_at,
+    is_nps_test_mode,
+    parse_score_callback,
+    parse_skip_callback,
+    patient_nps_due_at,
+    score_keyboard,
+    score_label,
 )
 from history_formatter import MetisHistoryFormatterClient
 from judging_client import MetisJudgingClient
@@ -382,7 +402,12 @@ def _send_phase_questions(
     )
 
 
-def _send_text(token: str, chat_id: str, text: str, reply_markup: dict | None = None) -> None:
+def _send_text(
+    token: str,
+    chat_id: str,
+    text: str,
+    reply_markup: dict | None = None,
+) -> int | None:
     payload: dict[str, object] = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
@@ -395,6 +420,42 @@ def _send_text(token: str, chat_id: str, text: str, reply_markup: dict | None = 
     data = response.json()
     if not data.get("ok"):
         raise RuntimeError(f"sendMessage failed: {data}")
+    result = data.get("result")
+    if isinstance(result, dict) and result.get("message_id") is not None:
+        return int(result["message_id"])
+    return None
+
+
+def _clear_inline_keyboard(token: str, chat_id: str, message_id: int) -> None:
+    try:
+        response = _http.post(
+            f"https://tapi.bale.ai/bot{token}/editMessageReplyMarkup",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []},
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except Exception as err:
+        metis_log(
+            "bot",
+            "clear_inline_keyboard_failed",
+            chat_id=chat_id,
+            message_id=message_id,
+            error=str(err)[:200],
+        )
+
+
+def _callback_message_id(callback_query: dict) -> int | None:
+    message = callback_query.get("message")
+    if not isinstance(message, dict):
+        return None
+    message_id = message.get("message_id")
+    if message_id is None:
+        return None
+    return int(message_id)
 
 
 def _answer_callback_query(token: str, callback_query_id: str, text: str = "") -> None:
@@ -580,6 +641,36 @@ def _deliver_judgment_to_patient(
         patient_chat_id=patient_chat_id,
         judgment_text=patient_text,
     )
+    _schedule_nps_after_delivery(
+        db,
+        session_id=session_id,
+        patient_chat_id=patient_chat_id,
+        doctor_bale_chat_id=doctor_bale_chat_id or _resolve_doctor_chat_id(db),
+    )
+
+
+def _schedule_nps_after_delivery(
+    db: Database,
+    *,
+    session_id: int,
+    patient_chat_id: str,
+    doctor_bale_chat_id: str,
+) -> None:
+    db.create_nps_survey(
+        session_id,
+        patient_chat_id,
+        SURVEY_PATIENT,
+        TRIGGER_JUDGMENT_DELIVERED,
+        patient_nps_due_at(),
+    )
+    if doctor_bale_chat_id:
+        db.create_nps_survey(
+            session_id,
+            doctor_bale_chat_id,
+            SURVEY_DOCTOR,
+            TRIGGER_DOCTOR_REVIEW_SENT,
+            doctor_nps_due_at(),
+        )
 
 
 def _schedule_followup_after_delivery(
@@ -649,6 +740,200 @@ def _process_due_followups(db: Database, *, token: str) -> None:
                 session_id=followup.session_id,
                 error=str(err)[:300],
             )
+
+
+def _nps_question(survey_type: str) -> str:
+    if survey_type == SURVEY_DOCTOR:
+        return DOCTOR_QUESTION
+    return PATIENT_QUESTION
+
+
+def _start_nps_survey(db: Database, *, token: str, survey: NpsSurvey) -> None:
+    if not db.try_claim_due_nps_survey(survey.id):
+        return
+    question = _nps_question(survey.survey_type)
+    message_id = _send_text(
+        token,
+        survey.chat_id,
+        question,
+        reply_markup=score_keyboard(survey.id),
+    )
+    db.append_message(survey.session_id, "nps_bot", question)
+    if message_id is not None:
+        db.update_nps_survey(survey.id, inline_message_id=message_id)
+
+
+def _process_due_nps_surveys(db: Database, *, token: str) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for survey in db.get_due_nps_surveys(now_iso):
+        try:
+            _start_nps_survey(db, token=token, survey=survey)
+        except Exception as err:
+            metis_log(
+                "bot",
+                "nps_start_error",
+                survey_id=survey.id,
+                error=str(err)[:300],
+            )
+
+
+def _send_nps_comment_prompt(
+    db: Database,
+    *,
+    token: str,
+    survey: NpsSurvey,
+    score: int,
+) -> None:
+    prompt = build_comment_prompt(score)
+    message_id = _send_text(
+        token,
+        survey.chat_id,
+        prompt,
+        reply_markup=comment_keyboard(survey.id),
+    )
+    db.append_message(survey.session_id, "nps_bot", prompt)
+    if message_id is not None:
+        db.update_nps_survey(survey.id, inline_message_id=message_id)
+
+
+def _clear_nps_inline_keyboards(
+    token: str,
+    survey: NpsSurvey,
+    *,
+    extra_message_id: int | None = None,
+) -> None:
+    for message_id in {survey.inline_message_id, extra_message_id}:
+        if message_id is not None:
+            _clear_inline_keyboard(token, survey.chat_id, message_id)
+
+
+def _complete_nps_survey(
+    db: Database,
+    *,
+    token: str,
+    survey: NpsSurvey,
+    comment: str = "",
+    clear_message_id: int | None = None,
+) -> None:
+    _clear_nps_inline_keyboards(
+        token,
+        survey,
+        extra_message_id=clear_message_id,
+    )
+    db.update_nps_survey(
+        survey.id,
+        status="completed",
+        step="",
+        comment=comment,
+        clear_inline_message_id=True,
+    )
+    if comment.strip():
+        db.append_message(survey.session_id, "nps_user", comment.strip())
+    thanks = build_thanks(survey.survey_type)
+    reply_markup = (
+        _doctor_judgment_keyboard()
+        if survey.survey_type == SURVEY_DOCTOR
+        else _chat_keyboard()
+    )
+    _send_text(token, survey.chat_id, thanks, reply_markup=reply_markup)
+    db.append_message(survey.session_id, "nps_bot", thanks)
+
+
+def _process_nps_comment_message(
+    db: Database,
+    *,
+    token: str,
+    chat_id: str,
+    text: str,
+) -> bool:
+    survey = db.get_active_nps_for_chat(chat_id)
+    if not survey:
+        return False
+    if survey.step == "score":
+        _send_text(
+            token,
+            chat_id,
+            NPS_USE_BUTTONS,
+            reply_markup=score_keyboard(survey.id),
+        )
+        db.append_message(survey.session_id, "nps_bot", NPS_USE_BUTTONS)
+        return True
+    if survey.step != "comment":
+        return False
+    if text.strip() == NPS_SKIP_COMMENT:
+        _complete_nps_survey(
+            db,
+            token=token,
+            survey=survey,
+            clear_message_id=survey.inline_message_id,
+        )
+        return True
+    _complete_nps_survey(
+        db,
+        token=token,
+        survey=survey,
+        comment=text.strip(),
+        clear_message_id=survey.inline_message_id,
+    )
+    return True
+
+
+def _process_nps_callback(
+    db: Database,
+    *,
+    token: str,
+    callback_query: dict,
+) -> None:
+    callback_id = str(callback_query.get("id") or "")
+    data = str(callback_query.get("data") or "").strip()
+    sender = callback_query.get("from") or callback_query.get("from_user") or {}
+    chat_id = str(sender.get("id") or "").strip()
+    if not callback_id or not data or not chat_id:
+        return
+
+    score_parsed = parse_score_callback(data)
+    if score_parsed:
+        survey_id, score = score_parsed
+        survey = db.get_nps_survey(survey_id)
+        if (
+            not survey
+            or survey.chat_id != chat_id
+            or survey.status != "in_progress"
+            or survey.step != "score"
+        ):
+            _answer_callback_query(token, callback_id, text="نظرسنجی فعال نیست.")
+            return
+        label = score_label(score)
+        db.append_message(survey.session_id, "nps_user", label)
+        db.update_nps_survey(survey.id, score=score, step="comment")
+        score_message_id = _callback_message_id(callback_query)
+        if score_message_id is not None:
+            _clear_inline_keyboard(token, chat_id, score_message_id)
+        _answer_callback_query(token, callback_id, text="ثبت شد")
+        _send_nps_comment_prompt(db, token=token, survey=survey, score=score)
+        return
+
+    skip_id = parse_skip_callback(data)
+    if skip_id is not None:
+        survey = db.get_nps_survey(skip_id)
+        if (
+            not survey
+            or survey.chat_id != chat_id
+            or survey.status != "in_progress"
+            or survey.step != "comment"
+        ):
+            _answer_callback_query(token, callback_id, text="نظرسنجی فعال نیست.")
+            return
+        db.append_message(survey.session_id, "nps_user", NPS_SKIP_COMMENT)
+        skip_message_id = _callback_message_id(callback_query)
+        _answer_callback_query(token, callback_id, text="ثبت شد")
+        _complete_nps_survey(
+            db,
+            token=token,
+            survey=survey,
+            clear_message_id=skip_message_id,
+        )
+        return
 
 
 def _send_followup_redflag_question(
@@ -824,6 +1109,9 @@ def _process_callback_query(
             callback_query=callback_query,
         )
         return
+    if data.startswith("nps:"):
+        _process_nps_callback(db, token=token, callback_query=callback_query)
+        return
     _process_judgment_callback(db, token=token, callback_query=callback_query)
 
 
@@ -962,6 +1250,7 @@ def _begin_patient_session(
     user_label: str,
 ) -> None:
     db.cancel_followups_for_chat(chat_id)
+    db.cancel_nps_for_chat(chat_id)
     deepseek.reset_session(chat_id)
     session_id = db.create_session(chat_id)
     db.append_message(session_id, "user", user_label)
@@ -1014,6 +1303,13 @@ def _process_text_message(
 
     doctor_chat_id = _resolve_doctor_chat_id(db)
     if doctor_chat_id and chat_id == doctor_chat_id:
+        if _process_nps_comment_message(
+            db,
+            token=token,
+            chat_id=chat_id,
+            text=text,
+        ):
+            return
         if _process_doctor_edit_message(
             db,
             token=token,
@@ -1037,6 +1333,14 @@ def _process_text_message(
             chat_id=chat_id,
             user_label=text,
         )
+        return
+
+    if _process_nps_comment_message(
+        db,
+        token=token,
+        chat_id=chat_id,
+        text=text,
+    ):
         return
 
     active_followup = db.get_active_followup_for_chat(chat_id)
@@ -1262,6 +1566,11 @@ def main() -> None:
             "Follow-up TEST MODE: emergency=10s, urgent=1m, routine=5m (poll every 5s)",
             flush=True,
         )
+    if is_nps_test_mode():
+        print(
+            "NPS TEST MODE: patient=2m after judgment, doctor=3s after send (same poll)",
+            flush=True,
+        )
     print("Bale bot is running (HTTP long polling).", flush=True)
     offset: int | None = None
     last_followup_poll = 0.0
@@ -1272,6 +1581,7 @@ def main() -> None:
                 now_mono = time.monotonic()
                 if now_mono - last_followup_poll >= followup_poll_interval_sec():
                     _process_due_followups(db, token=token)
+                    _process_due_nps_surveys(db, token=token)
                     last_followup_poll = now_mono
 
                 payload: dict[str, int] = {"timeout": 30}
